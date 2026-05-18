@@ -1,0 +1,75 @@
+# AI Radar — tool config.
+# Paths can use ~ for home. Env-var references are resolved at runtime.
+
+vault:
+  path: ~/source/ai-radar-vault
+
+# Each provider is an OpenAI-compatible chat endpoint.
+# base_url_env points at an env var (lets you swap proxy hosts without editing config).
+# api_key_env: null means no auth header (used for local LMStudio/Ollama).
+providers:
+  academic-mistral:
+    base_url_env: ACADEMIC_BASE_URL
+    api_key_env: ACADEMIC_API_KEY
+    model: mistral-small-4-119b-2603
+    timeout_s: 60
+  academic-gpt-oss:
+    base_url_env: ACADEMIC_BASE_URL
+    api_key_env: ACADEMIC_API_KEY
+    model: gpt-oss-120b
+    timeout_s: 120
+  local-lmstudio:
+    base_url_env: LMSTUDIO_BASE_URL
+    api_key_env: null
+    # Set this to whatever model identifier LMStudio exposes for the model you loaded.
+    model: local-model
+    timeout_s: 180
+
+# Per-task provider chains. The router tries them in order; on terminal failure it falls through.
+tasks:
+  classification:
+    - academic-mistral
+    - local-lmstudio
+  enrichment:
+    - academic-gpt-oss
+    - academic-mistral
+    - local-lmstudio
+  digest:
+    - academic-gpt-oss
+    - academic-mistral
+
+# Embedding backend. Same OpenAI-compatible shape (Ollama exposes /v1/embeddings).
+embeddings:
+  base_url_env: OLLAMA_BASE_URL
+  api_key_env: null
+  model: nomic-embed-text
+  # Ollama's OpenAI-compatible path appends /v1, so the effective URL is base_url + /v1/embeddings.
+  openai_compat_suffix: /v1
+
+github:
+  api_base: https://api.github.com
+  token_env: GITHUB_PAT
+  # commits in the last N days reported as commits_30d in snapshots.
+  commit_window_days: 30
+
+thresholds:
+  # Any one of these triggers "significant change" in enrich output.
+  signal_change:
+    abs_star_delta: 50
+    rel_star_delta_pct: 20
+    rel_commits_30d_pct: 50
+  # Cosine similarity above this on capture triggers a possible-duplicate warning.
+  semantic_dedup: 0.85
+
+retry:
+  max_attempts: 4
+  initial_backoff_s: 1.0
+  max_backoff_s: 30.0
+
+logging:
+  level: INFO
+  file: logs/ai-radar.log
+
+paths:
+  context: context.md
+  enrich_output: logs/last_enrich.json
