@@ -11,40 +11,52 @@ providers:
   academic-mistral:
     base_url_env: ACADEMIC_BASE_URL
     api_key_env: ACADEMIC_API_KEY
-    model: mistral-small-4-119b-2603
+    model: "Mistral Small 4 119B 2603 KI:EZ"
     timeout_s: 60
   academic-gpt-oss:
     base_url_env: ACADEMIC_BASE_URL
     api_key_env: ACADEMIC_API_KEY
-    model: gpt-oss-120b
+    model: "OpenAI GPT OSS 120B KI:Inferenz.nrw"
     timeout_s: 120
   local-lmstudio:
     base_url_env: LMSTUDIO_BASE_URL
     api_key_env: null
     # Set this to whatever model identifier LMStudio exposes for the model you loaded.
-    model: local-model
+    model: qwen/qwen3.5-9b
     timeout_s: 180
+    # /no_think is prepended to the user message to request non-thinking mode.
+    # Some LMStudio versions still route output through reasoning_content even
+    # so; the router reads that field as a fallback automatically.
+    no_think: true
+    # Reasoning models need a large token budget: thinking tokens + response
+    # tokens must both fit. 16k covers even verbose chains-of-thought.
+    max_tokens: 16384
 
 # Per-task provider chains. The router tries them in order; on terminal failure it falls through.
 tasks:
   classification:
+    - local-lmstudio
+    - academic-mistral
+  enrichment:
+    - academic-gpt-oss
     - academic-mistral
     - local-lmstudio
-  enrichment:
+  reevaluation:
     - academic-gpt-oss
     - academic-mistral
     - local-lmstudio
   digest:
     - academic-gpt-oss
     - academic-mistral
+    - local-lmstudio
 
-# Embedding backend. Same OpenAI-compatible shape (Ollama exposes /v1/embeddings).
+# Embedding backend. LMStudio exposes /v1/embeddings when an embedding model is loaded
+# alongside (or in place of) a chat model. Load e.g. `text-embedding-nomic-embed-text-v1.5`
+# in LMStudio and update `model` below to whatever id LMStudio reports.
 embeddings:
-  base_url_env: OLLAMA_BASE_URL
+  base_url_env: LMSTUDIO_BASE_URL
   api_key_env: null
-  model: nomic-embed-text
-  # Ollama's OpenAI-compatible path appends /v1, so the effective URL is base_url + /v1/embeddings.
-  openai_compat_suffix: /v1
+  model: text-embedding-nomic-embed-text-v1.5
 
 github:
   api_base: https://api.github.com
@@ -59,7 +71,7 @@ thresholds:
     rel_star_delta_pct: 20
     rel_commits_30d_pct: 50
   # Cosine similarity above this on capture triggers a possible-duplicate warning.
-  semantic_dedup: 0.85
+  semantic_dedup: 0.92
 
 retry:
   max_attempts: 4

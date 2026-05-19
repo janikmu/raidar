@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AI Radar — weekly digest.
+  Fires Sundays at 21:00 local time, one hour after enrich.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.airadar.digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>jobs.digest</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__TOOL_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__TOOL_DIR__/logs/launchd.digest.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__TOOL_DIR__/logs/launchd.digest.err.log</string>
+</dict>
+</plist>
