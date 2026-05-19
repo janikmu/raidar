@@ -21,6 +21,17 @@ class ProviderConfig:
     api_key: str | None
     model: str
     timeout_s: float
+    # When true, prepend /no_think to the user message to request that
+    # Qwen3 / DeepSeek-R1 skip chain-of-thought reasoning.
+    # Note: some LMStudio versions still route all output through reasoning_content
+    # even with /no_think — the router handles this transparently.
+    no_think: bool = False
+    # Appended to the system prompt on every call.
+    system_suffix: str | None = None
+    # Minimum max_tokens to use for this provider. Useful for local reasoning
+    # models (Qwen3, DeepSeek-R1) that need a large budget to think + respond.
+    # If the call-site requests fewer tokens, this value wins.
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -47,12 +58,17 @@ def _resolve_provider(name: str, raw: dict[str, Any]) -> ProviderConfig:
     api_key_env = raw.get("api_key_env")
     base_url = secrets.get(base_url_env) if base_url_env else raw.get("base_url")
     api_key = secrets.get(api_key_env) if api_key_env else None
+    suffix = raw.get("system_suffix")
+    max_tokens_raw = raw.get("max_tokens")
     return ProviderConfig(
         name=name,
         base_url=base_url,
         api_key=api_key,
         model=raw["model"],
         timeout_s=float(raw.get("timeout_s", 60)),
+        no_think=bool(raw.get("no_think", False)),
+        system_suffix=suffix if suffix else None,
+        max_tokens=int(max_tokens_raw) if max_tokens_raw is not None else None,
     )
 
 
