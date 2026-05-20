@@ -1,0 +1,66 @@
+# Curated seed list of canonical AI-tooling concepts.
+#
+# Each entry asks the LLM to produce a concept entry using its training-data
+# knowledge of the AI/dev-tooling landscape. The LLM may return confident=false
+# to decline a concept it can't speak to with high confidence — that concept is
+# simply skipped (no file written).
+#
+# Keep this list tight. Add only concepts whose lifecycle status is
+# undisputable across the industry. Per-user / per-research-niche concepts
+# belong in the artifact-driven flow (capture / enrich), not here.
+#
+# Schema:
+#   - id:    kebab-case slug; becomes the filename concepts/{id}.md
+#     label: human-readable concept name shown in UIs
+#     hint:  one-phrase anchor (origin org, year, what it covers). Helps the
+#            LLM disambiguate from similarly-named ideas. Do NOT pre-judge
+#            lifecycle status in the hint — that's the LLM's job.
+
+concepts:
+  - id: model-context-protocol
+    label: Model Context Protocol
+    hint: "Anthropic's open protocol for connecting LLMs to tools and context sources, introduced Nov 2024"
+
+  - id: retrieval-augmented-generation
+    label: Retrieval-Augmented Generation
+    hint: "Pattern that grounds LLM outputs in retrieved documents from an external knowledge store; coined 2020"
+
+  - id: agentic-rag
+    label: Agentic RAG
+    hint: "RAG variant where an agent plans, decomposes, and iteratively retrieves rather than one-shot retrieval"
+
+  - id: function-calling
+    label: Function Calling
+    hint: "Pattern where LLMs emit structured tool calls against a typed schema; OpenAI 2023, now industry-standard"
+
+  - id: react-pattern
+    label: ReAct Pattern
+    hint: "Reasoning+Acting loop — interleave chain-of-thought with tool calls. Yao et al. 2022"
+
+  - id: chain-of-thought-prompting
+    label: Chain-of-Thought Prompting
+    hint: "Prompting technique eliciting step-by-step intermediate reasoning before answer; Wei et al. 2022"
+
+  - id: vector-embeddings
+    label: Vector Embeddings
+    hint: "Dense numerical representations of text/code/images used for semantic similarity and retrieval"
+
+  - id: multi-agent-orchestration
+    label: Multi-Agent Orchestration
+    hint: "Coordinating multiple specialized LLM agents on a shared task — CrewAI, AutoGen, LangGraph era"
+
+  - id: prompt-engineering
+    label: Prompt Engineering
+    hint: "Practice of designing prompts and instructions to steer LLM behavior"
+
+  - id: llm-evaluation
+    label: LLM Evaluation
+    hint: "Frameworks and methods for measuring LLM/agent quality — benchmarks, judges, red-teaming"
+
+  - id: agent-memory
+    label: Agent Memory
+    hint: "Persistent or long-context memory mechanisms for stateful agents across sessions/tasks"
+
+  - id: tool-use
+    label: Tool Use
+    hint: "LLMs invoking external tools (APIs, code execution, search) to extend their capabilities"

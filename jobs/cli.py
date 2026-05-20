@@ -1,7 +1,8 @@
 """raidar — AI Radar command-line interface.
 
 Usage:
-    raidar init               [--vault PATH]
+    raidar init               [--vault PATH] [--seed]
+    raidar seed               [--id ID]... [--list] [--dry-run] [--force]
     raidar capture <url>      [--force] [--update ID] [--dry-run]
     raidar bulk-capture <url> [--dry-run] [--limit N] [--force]
     raidar enrich             [--only ID] [--dry-run]
@@ -46,12 +47,14 @@ from jobs.backfill import backfill  # noqa: E402
 from jobs.reevaluate import reevaluate  # noqa: E402
 from jobs.digest import main as _digest_cmd  # noqa: E402
 from jobs.search import app as _search_app  # noqa: E402
+from jobs.seed import seed as _seed_cmd  # noqa: E402
 
 app.command("capture")(capture)
 app.command("bulk-capture")(bulk)
 app.command("backfill")(backfill)
 app.command("reevaluate")(reevaluate)
 app.command("digest")(_digest_cmd)
+app.command("seed")(_seed_cmd)
 app.add_typer(_search_app, name="search")
 
 # ---------------------------------------------------------------------------
@@ -231,6 +234,13 @@ def init_cmd(
         "--vault",
         help="Vault directory path (default: ~/raidar-vault).",
     ),
+    seed: bool = typer.Option(
+        False,
+        "--seed",
+        help="After scaffolding, run `raidar seed` to seed canonical concepts "
+             "(MCP, RAG, ReAct, ...) from training-data knowledge. Skipped if "
+             "required env vars aren't set yet.",
+    ),
 ) -> None:
     """Create the vault directory structure and scaffold the project config."""
     project_dir = Path.cwd()
@@ -334,7 +344,16 @@ def init_cmd(
     if not env_path.exists():
         typer.echo(f"\n  No .env found — create one at {env_path} with the vars above.")
 
-    # ---- 8. Summary ----------------------------------------------------
+    # ---- 8. Optional seed ---------------------------------------------
+    if seed:
+        if not all_required_set:
+            typer.echo("\n  --seed skipped: required env vars not set yet.")
+            typer.echo("  Set them in .env, then run: raidar seed")
+        else:
+            typer.echo("\n  Seeding canonical concepts (raidar seed)…")
+            _seed_cmd(ids=None, list_only=False, dry_run=False, force=False)
+
+    # ---- 9. Summary ----------------------------------------------------
     typer.echo("")
     if all_required_set:
         typer.echo("  Ready. Try: raidar capture https://github.com/owner/repo")
