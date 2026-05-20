@@ -2,8 +2,10 @@
 
 Design notes
 ------------
-- Backend: OpenAI-compatible HTTP endpoint (default: Ollama at /v1/embeddings).
-- Storage: a single JSON file at ``{vault_path}/embeddings/index.json``.
+- Backend: OpenAI-compatible HTTP endpoint (default: LMStudio at /v1/embeddings).
+- Storage: separate JSON files per vault layer:
+      {vault_path}/embeddings/concepts.json   # concept body embeddings
+      {vault_path}/embeddings/artifacts.json  # artifact body embeddings
   Schema per entry:
       {
         "vector": [float, ...],   # L2-normalized
@@ -122,16 +124,31 @@ def _l2_normalize(vec: list[float]) -> list[float]:
 class Index:
     """JSON-backed embedding index with numpy cosine search.
 
+    `layer` selects which index file to use:
+      - 'concepts'  → embeddings/concepts.json
+      - 'artifacts' → embeddings/artifacts.json
+
     Vectors are L2-normalized at upsert time, so ``search`` is just a dot
     product against a stacked matrix of normalized rows.
     """
 
-    def __init__(self, cfg: Config | None = None) -> None:
+    _LAYER_FILES = {
+        "concepts": "concepts.json",
+        "artifacts": "artifacts.json",
+    }
+
+    def __init__(self, cfg: Config | None = None, layer: str = "artifacts") -> None:
         self._cfg = cfg or load()
+        if layer not in self._LAYER_FILES:
+            raise ValueError(
+                f"Unknown index layer {layer!r}; choose from {list(self._LAYER_FILES)}"
+            )
+        self._layer = layer
         self._dir: Path = self._cfg.vault_path / "embeddings"
-        self._path: Path = self._dir / "index.json"
+        self._path: Path = self._dir / self._LAYER_FILES[layer]
         self._entries: dict[str, IndexEntry] = {}
         self._load()
+
 
     # ---- persistence -----------------------------------------------------
 

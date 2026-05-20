@@ -4,12 +4,12 @@ into the vault as `digests/YYYY-MM-DD.md`.
 Pulls four streams from the vault:
 
   1. Enrich output (logs/last_enrich.json) — what moved this week.
-  2. New entities — frontmatter.first_seen within the last 7 days.
-  3. Current watch list — latest signal snapshot for each.
-  4. Current adopt list — how long each has been at status=adopt.
+  2. New concepts — frontmatter.first_seen within the last 7 days.
+  3. Current watch-list concepts with their artifact evaluations.
+  4. Current invest-status concepts as invest reminders.
+  5. Concepts flagged review_needed.
 
-Hands a compact, structured prompt to the LLM router (task="digest") and
-writes the returned markdown via `vault.write_digest`. One LLM call total.
+One LLM call total (task="digest").
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 import typer
 
 from lib import config, logging_setup, vault
-from lib.entity_body import parse as parse_body
+from lib.body import parse as parse_body
 from lib.llm import AllProvidersFailed, Router
 
 logger = logging.getLogger(__name__)
@@ -112,91 +112,110 @@ def _format_enrich_section(enrich: dict[str, Any], today: date) -> str:
             "No enrich run output available.\n"
         )
 
-    evaluated = enrich.get("evaluated", 0)
-    moved = enrich.get("moved", []) or []
+    art_moved = enrich.get("artifact_evaluations_changed") or enrich.get("moved", []) or []
+    concept_moved = enrich.get("concept_status_changed") or []
     sig_changes = enrich.get("significant_signal_changes", []) or []
     errors = enrich.get("errors", 0)
 
     lines: list[str] = [
         f"## Enrichment summary (for the week ending {today.isoformat()})",
-        f"Evaluated: {evaluated}",
-        f"Moved status: {len(moved)}",
     ]
-    for item in moved:
-        eid = item.get("id", "?")
-        frm = item.get("from", "?")
-        to = item.get("to", "?")
-        rationale = (item.get("rationale") or "").strip()
-        lines.append(f"  - {eid}: {frm} -> {to}. Rationale: {rationale}")
-
-    lines.append(f"Significant signal changes (no status flip): {len(sig_changes)}")
-    for item in sig_changes:
-        eid = item.get("id", "?")
-        sd = item.get("stars_delta", 0)
-        cd = item.get("commits_30d_delta", 0)
-        lines.append(f"  - {eid}: stars_delta={sd}, commits_30d_delta={cd}")
-
-    # `errors` may be a count or a list — accept either.
+    if concept_moved:
+        lines.append(f"Concept status changes ({len(concept_moved)}):")
+        for item in concept_moved:
+            frm = item.get("from", "?")
+            to = item.get("to", "?")
+            rationale = (item.get("rationale") or "").strip()[:120]
+            lines.append(f"  - {item.get('id','?')}: {frm} -> {to}. {rationale}")
+    if art_moved:
+        lines.append(f"Artifact evaluation changes ({len(art_moved)}):")
+        for item in art_moved:
+            frm = item.get("from", "?")
+            to = item.get("to", "?")
+            rationale = (item.get("rationale") or "").strip()[:120]
+            lines.append(f"  - {item.get('id','?')}: {frm} -> {to}. {rationale}")
+    if sig_changes:
+        lines.append(f"Notable signal changes: {len(sig_changes)}")
+        for item in sig_changes:
+            d = item.get("deltas") or {}
+            sd = d.get("stars_delta")
+            lines.append(f"  - {item.get('id','?')}: Δstars={sd:+d}" if sd is not None else f"  - {item.get('id','?')}")
     err_count = len(errors) if isinstance(errors, list) else int(errors or 0)
-    lines.append(f"Errors during enrich: {err_count}")
+    if err_count:
+        lines.append(f"Errors during enrich: {err_count}")
     return "\n".join(lines) + "\n"
 
 
-def _format_new_section(new_entities: list[vault.Entity]) -> str:
-    lines = ["## New this week"]
-    if not new_entities:
+def _format_new_concepts_section(concepts: list[vault.Concept]) -> str:
+    lines = ["## New concepts this week"]
+    if not concepts:
         lines.append("  (none)")
         return "\n".join(lines) + "\n"
-    for e in new_entities:
-        type_ = e.frontmatter.get("type", "?")
-        status = e.frontmatter.get("status", "?")
-        relevance = e.frontmatter.get("relevance", "?")
-        gist = _section_summary(e.body, "What it is")
+    for c in concepts:
+        fm = c.frontmatter
+        gist = _section_summary(c.body, "What it is")
+        n_arts = len(fm.get("artifacts") or [])
         lines.append(
-            f"  - {e.id} ({type_}, {status}, relevance={relevance}): {gist}"
+            f"  - {c.id} ({fm.get('status','?')}, relevance={fm.get('relevance','?')}, "
+            f"{n_arts} artifact(s)): {gist}"
         )
     return "\n".join(lines) + "\n"
 
 
-def _format_watch_section(watch_entities: list[vault.Entity]) -> str:
-    lines = ["## Current watch list"]
-    if not watch_entities:
+def _format_watch_section(watch_concepts: list[vault.Concept]) -> str:
+    lines = ["## Watch-list pulse"]
+    if not watch_concepts:
         lines.append("  (none)")
         return "\n".join(lines) + "\n"
-    for e in watch_entities:
-        snap = _latest_signal(e.id) or {}
-        stars = snap.get("stars", "?")
-        commits = snap.get("commits_30d", "?")
-        last_eval = e.frontmatter.get("last_evaluated", "?")
+    for c in watch_concepts:
+        fm = c.frontmatter
+        arts = fm.get("artifacts") or []
+        eval_counts: dict[str, int] = {}
+        for entry in arts:
+            art_id = entry.get("id") if isinstance(entry, dict) else str(entry)
+            art = vault.read_artifact(art_id)
+            if art:
+                ev = art.frontmatter.get("evaluation", "new")
+                eval_counts[ev] = eval_counts.get(ev, 0) + 1
+        eval_str = ", ".join(f"{k}={v}" for k, v in sorted(eval_counts.items()))
+        last_eval = fm.get("last_evaluated", "?")
         lines.append(
-            f"  - {e.id}: stars={stars}, commits_30d={commits}  (last_evaluated={last_eval})"
+            f"  - {c.id}: [{eval_str or 'no artifacts'}]  (last_evaluated={last_eval})"
         )
     return "\n".join(lines) + "\n"
 
 
-def _format_adopt_section(adopt_entities: list[vault.Entity], today: date) -> str:
-    lines = ["## Adopt reminders"]
-    if not adopt_entities:
+def _format_invest_section(invest_concepts: list[vault.Concept], today: date) -> str:
+    lines = ["## Invest reminders"]
+    if not invest_concepts:
         lines.append("  (none)")
         return "\n".join(lines) + "\n"
-    for e in adopt_entities:
-        last_eval_raw = e.frontmatter.get("last_evaluated", "")
+    for c in invest_concepts:
+        fm = c.frontmatter
+        last_eval_raw = fm.get("last_evaluated", "")
         last_eval_d = _parse_iso_date(last_eval_raw)
-        if last_eval_d is not None:
-            days = (today - last_eval_d).days
-            since = f"{last_eval_raw} ({days}d ago)"
-        else:
-            since = "unknown"
-        assessment = _section_summary(e.body, "Current assessment")
-        lines.append(f"  - {e.id}: at adopt since {since}.  ({assessment})")
+        days = (today - last_eval_d).days if last_eval_d else None
+        since = f"{last_eval_raw} ({days}d ago)" if days is not None else "unknown"
+        assessment = _section_summary(c.body, "Current assessment")
+        lines.append(f"  - {c.id}: at invest since {since}.  ({assessment})")
+    return "\n".join(lines) + "\n"
+
+
+def _format_review_section(review_concepts: list[vault.Concept]) -> str:
+    lines = ["## Needs your review"]
+    if not review_concepts:
+        return ""
+    for c in review_concepts:
+        fm = c.frontmatter
+        lines.append(f"  - {c.id} ({fm.get('label','')}): review_needed flag set")
     return "\n".join(lines) + "\n"
 
 
 _PROMPT_INSTRUCTION = (
     "Write a weekly digest of this AI tooling intelligence. Be ruthlessly concise — "
     "readable in five minutes. Use this structure: "
-    "## New this week / ## Moved / ## Watch-list pulse / ## Adopt reminder. "
-    "Each entry one or two lines. Skip sections that have no content. "
+    "## New This Week / ## Moved / ## Watch-List Pulse / ## Invest Reminders / ## Needs Your Review. "
+    "Each entry: one or two lines. Skip sections that have no content. "
     "Markdown formatting. Do not invent facts not in the input."
 )
 
@@ -205,26 +224,29 @@ def assemble_prompt(
     *,
     context_text: str,
     enrich: dict[str, Any],
-    new_entities: list[vault.Entity],
-    watch_entities: list[vault.Entity],
-    adopt_entities: list[vault.Entity],
+    new_concepts: list[vault.Concept],
+    watch_concepts: list[vault.Concept],
+    invest_concepts: list[vault.Concept],
+    review_concepts: list[vault.Concept],
     today: date,
 ) -> str:
     """Build the single prompt string handed to the LLM."""
+    review_block = _format_review_section(review_concepts)
     parts = [
         "## My context",
         context_text.strip() or "(no context provided)",
         "",
         _format_enrich_section(enrich, today).rstrip(),
         "",
-        _format_new_section(new_entities).rstrip(),
+        _format_new_concepts_section(new_concepts).rstrip(),
         "",
-        _format_watch_section(watch_entities).rstrip(),
+        _format_watch_section(watch_concepts).rstrip(),
         "",
-        _format_adopt_section(adopt_entities, today).rstrip(),
-        "",
-        _PROMPT_INSTRUCTION,
+        _format_invest_section(invest_concepts, today).rstrip(),
     ]
+    if review_block:
+        parts += ["", review_block.rstrip()]
+    parts += ["", _PROMPT_INSTRUCTION]
     return "\n".join(parts) + "\n"
 
 
@@ -233,15 +255,15 @@ def assemble_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _collect_new_entities(today: date, window_days: int = 7) -> list[vault.Entity]:
+def _collect_new_concepts(today: date, window_days: int = 7) -> list[vault.Concept]:
     cutoff = today - timedelta(days=window_days)
-    out: list[vault.Entity] = []
-    for entity in vault.list_entities():
-        first_seen = _parse_iso_date(entity.frontmatter.get("first_seen"))
+    out: list[vault.Concept] = []
+    for concept in vault.list_concepts():
+        first_seen = _parse_iso_date(concept.frontmatter.get("first_seen"))
         if first_seen is None:
             continue
         if first_seen >= cutoff:
-            out.append(entity)
+            out.append(concept)
     return out
 
 
@@ -260,31 +282,33 @@ def run_digest(*, target_date: date, dry_run: bool) -> None:
 
     context_text = _load_context(cfg.context_path)
     enrich = _load_enrich_output(cfg.enrich_output_path)
-    new_entities = _collect_new_entities(target_date)
-    watch_entities = vault.list_entities(status="watch")
-    adopt_entities = vault.list_entities(status="adopt")
+    new_concepts = _collect_new_concepts(target_date)
+    watch_concepts = vault.list_concepts(status="watch")
+    invest_concepts = vault.list_concepts(status="invest")
+    review_concepts = [c for c in vault.list_concepts() if c.frontmatter.get("review_needed")]
+
+    concept_moved = len(enrich.get("concept_status_changed") or [])
+    art_moved = len(enrich.get("artifact_evaluations_changed") or enrich.get("moved", []) or [])
 
     logger.info(
-        "digest inputs: new=%d watch=%d adopt=%d enrich_moved=%d",
-        len(new_entities),
-        len(watch_entities),
-        len(adopt_entities),
-        len(enrich.get("moved", []) or []),
+        "digest inputs: new_concepts=%d watch=%d invest=%d review=%d enrich_concept_moved=%d enrich_art_moved=%d",
+        len(new_concepts), len(watch_concepts), len(invest_concepts), len(review_concepts),
+        concept_moved, art_moved,
     )
 
     prompt = assemble_prompt(
         context_text=context_text,
         enrich=enrich,
-        new_entities=new_entities,
-        watch_entities=watch_entities,
-        adopt_entities=adopt_entities,
+        new_concepts=new_concepts,
+        watch_concepts=watch_concepts,
+        invest_concepts=invest_concepts,
+        review_concepts=review_concepts,
         today=target_date,
     )
 
     router = Router(cfg)
     available = router.available_providers("digest")
     if not available:
-        # Acceptance: prove input assembly works even with no LLM configured.
         logger.warning(
             "no providers configured for task=digest; printing assembled prompt only"
         )
@@ -304,10 +328,10 @@ def run_digest(*, target_date: date, dry_run: bool) -> None:
 
     body = completion.text
 
-    moved_count = len(enrich.get("moved", []) or [])
     coverage = (
-        f"(covering {len(new_entities)} new, {moved_count} moved, "
-        f"{len(watch_entities)} watched, {len(adopt_entities)} to adopt)"
+        f"(covering {len(new_concepts)} new concepts, {concept_moved} concept moves, "
+        f"{art_moved} artifact eval changes, "
+        f"{len(watch_concepts)} watched, {len(invest_concepts)} to invest)"
     )
 
     if dry_run:

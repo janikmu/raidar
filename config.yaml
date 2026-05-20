@@ -2,7 +2,7 @@
 # Paths can use ~ for home. Env-var references are resolved at runtime.
 
 vault:
-  path: ~/source/ai-radar-vault
+  path: ~/raidar-vault
 
 # Each provider is an OpenAI-compatible chat endpoint.
 # base_url_env points at an env var (lets you swap proxy hosts without editing config).
@@ -35,8 +35,8 @@ providers:
 # Per-task provider chains. The router tries them in order; on terminal failure it falls through.
 tasks:
   classification:
-    - local-lmstudio
     - academic-mistral
+    - local-lmstudio
   enrichment:
     - academic-gpt-oss
     - academic-mistral

@@ -116,8 +116,8 @@ def bulk(
             captured += 1
             continue
         try:
-            entity_id = _capture_one(gh_url, cfg, force=force, today=today)
-            log.info("bulk captured %s -> %s", slug, entity_id)
+            artifact_id = _capture_one(gh_url, cfg, force=force, today=today)
+            log.info("bulk captured %s -> %s", slug, artifact_id)
             captured += 1
         except CaptureSkipped as exc:
             log.debug("bulk skip %s: %s", slug, exc)

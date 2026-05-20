@@ -34,7 +34,7 @@ import yaml
 
 from lib import config as config_module
 from lib import vault
-from lib.entity_body import render_concept
+from lib.body import render_concept
 from lib.llm import AllProvidersFailed, Router
 from lib.logging_setup import setup as setup_logging
 from lib.vault import Concept

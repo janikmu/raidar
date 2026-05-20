@@ -3,16 +3,17 @@
 Subcommands:
     raidar search keyword <query>
     raidar search semantic <query> [--top-k N]
-    raidar search entity <id>
+    raidar search concept <id>
+    raidar search artifact <id>
     raidar search signals <id>
     raidar search digest [--last N]
-    raidar search list [--status S] [--type T]
+    raidar search list-concepts [--status S]
+    raidar search list-artifacts [--evaluation E] [--type T]
+    raidar search pending
 
 Output is plain text — readable to a human in the terminal and parseable
 by Claude reading stdout. Each command exits 0 on success (including the
-"no matches" case), 1 on expected errors (entity not found, invalid
-arguments), and 2 on infrastructure errors (e.g. the embeddings backend
-is unreachable).
+"no matches" case), 1 on expected errors, and 2 on infrastructure errors.
 """
 
 from __future__ import annotations
@@ -25,11 +26,14 @@ import typer
 
 from lib import vault
 from lib.embeddings import Index
-from lib.entity_body import parse as parse_body
+from lib.body import parse as parse_body
 from lib.vault import (
-    Entity,
-    list_entities,
-    read_entity,
+    Artifact,
+    Concept,
+    list_artifacts,
+    list_concepts,
+    read_artifact,
+    read_concept,
     read_recent_digests,
     read_signals,
 )
@@ -42,32 +46,45 @@ app = typer.Typer(add_completion=False, help=__doc__, no_args_is_help=True)
 # ---------------------------------------------------------------------------
 
 
-def _first_line_what_it_is(body: str) -> str:
-    """Return the first non-empty line under "## What it is", or "" if absent."""
+def _first_line(body: str, section: str) -> str:
+    """Return the first non-empty line of a named body section."""
     sections = parse_body(body)
-    what = sections.get("What it is", "").strip()
-    if not what:
-        return ""
-    for line in what.splitlines():
+    text = sections.get(section, "").strip()
+    for line in text.splitlines():
         stripped = line.strip()
         if stripped:
             return stripped
     return ""
 
 
-def _tags(entity: Entity) -> list[str]:
-    raw = entity.frontmatter.get("tags") or []
+def _tags_str(fm: dict) -> str:
+    raw = fm.get("tags") or []
     if isinstance(raw, str):
-        return [raw]
-    return [str(t) for t in raw]
+        return raw
+    return ", ".join(str(t) for t in raw)
 
 
-def _format_entity_block(entity: Entity, header: str) -> str:
-    tags = ", ".join(_tags(entity))
-    summary = _first_line_what_it_is(entity.body)
+def _format_concept_block(concept: Concept) -> str:
+    fm = concept.frontmatter
+    n_arts = len(fm.get("artifacts") or [])
+    summary = _first_line(concept.body, "What it is")
     lines = [
-        header,
-        f"tags: {tags}",
+        f"concept:{concept.id}  status={fm.get('status','?')}  relevance={fm.get('relevance','?')}  artifacts={n_arts}",
+        f"label: {fm.get('label', concept.id)}",
+        f"tags: {_tags_str(fm)}",
+    ]
+    if summary:
+        lines.append(summary)
+    return "\n".join(lines)
+
+
+def _format_artifact_block(artifact: Artifact) -> str:
+    fm = artifact.frontmatter
+    summary = _first_line(artifact.body, "What it is")
+    lines = [
+        f"artifact:{artifact.id}  type={fm.get('type','?')}  evaluation={fm.get('evaluation','?')}",
+        f"concept: {fm.get('concept', '?')}  relationship: {fm.get('relationship', '?')}",
+        f"tags: {_tags_str(fm)}",
     ]
     if summary:
         lines.append(summary)
@@ -79,44 +96,47 @@ def _format_entity_block(entity: Entity, header: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@app.command("keyword")
-def keyword_cmd(
-    query: str = typer.Argument(..., help="Substring to match (case-insensitive)."),
+@app.command()
+def keyword(
+    query: str = typer.Argument(..., help="Text to match against concept/artifact frontmatter."),
 ) -> None:
-    """Substring match against id, tags, type, status, and the first line of 'What it is'."""
-    q = query.lower().strip()
-    if not q:
-        print("ERROR: empty query.", file=sys.stderr)
-        raise typer.Exit(code=1)
+    """Search concepts and artifacts by keyword (frontmatter fields + tags)."""
+    q = query.lower()
 
-    matches: list[Entity] = []
-    for entity in list_entities():
-        fm = entity.frontmatter
-        haystacks: list[str] = [
-            str(fm.get("id", entity.id)),
-            str(fm.get("type", "")),
-            str(fm.get("status", "")),
-            _first_line_what_it_is(entity.body),
-        ]
-        haystacks.extend(_tags(entity))
-        if any(q in h.lower() for h in haystacks if h):
-            matches.append(entity)
+    found = False
 
-    if not matches:
-        print("No matches.")
-        return
+    # Search concepts
+    for concept in list_concepts():
+        fm = concept.frontmatter
+        haystack = " ".join([
+            concept.id,
+            fm.get("label", ""),
+            fm.get("status", ""),
+            _tags_str(fm),
+        ]).lower()
+        if q in haystack:
+            print(_format_concept_block(concept))
+            print()
+            found = True
 
-    blocks: list[str] = []
-    for entity in matches:
-        fm = entity.frontmatter
-        header = (
-            f"== {entity.id} "
-            f"({fm.get('type', '?')}, "
-            f"{fm.get('status', '?')}, "
-            f"relevance={fm.get('relevance', '?')}) =="
-        )
-        blocks.append(_format_entity_block(entity, header))
-    print("\n\n".join(blocks))
+    # Search artifacts
+    for artifact in list_artifacts():
+        fm = artifact.frontmatter
+        haystack = " ".join([
+            artifact.id,
+            fm.get("type", ""),
+            fm.get("evaluation", ""),
+            fm.get("concept", ""),
+            fm.get("github_repo", ""),
+            _tags_str(fm),
+        ]).lower()
+        if q in haystack:
+            print(_format_artifact_block(artifact))
+            print()
+            found = True
+
+    if not found:
+        print(f"No concepts or artifacts found matching {query!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -124,103 +144,97 @@ def keyword_cmd(
 # ---------------------------------------------------------------------------
 
 
-@app.command("semantic")
-def semantic_cmd(
-    query: str = typer.Argument(..., help="Natural-language query."),
+@app.command()
+def semantic(
+    query: str = typer.Argument(..., help="Natural language query."),
     top_k: int = typer.Option(5, "--top-k", help="Number of results to return."),
 ) -> None:
-    """Semantic search via the local embeddings index."""
-    if top_k < 1:
-        print("ERROR: --top-k must be >= 1.", file=sys.stderr)
-        raise typer.Exit(code=1)
+    """Semantic search across both concepts and artifacts."""
+    from lib import config
+    cfg = config.load()
 
-    index = Index()
-    try:
-        results = index.search(query, top_k=top_k)
-    except (openai.APIConnectionError, openai.APITimeoutError) as exc:
-        print(
-            f"ERROR: embeddings backend unreachable: {exc}",
-            file=sys.stderr,
-        )
-        raise typer.Exit(code=2) from exc
+    results: list[tuple[str, str, float]] = []  # (layer, id, score)
+
+    for layer in ("concepts", "artifacts"):
+        try:
+            idx = Index(cfg, layer=layer)
+            hits = idx.search(query, top_k=top_k)
+            results.extend((layer, item_id, score) for item_id, score in hits)
+        except openai.APIConnectionError as exc:
+            print(f"WARNING: embedding backend unreachable for {layer}: {exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: semantic search failed for {layer}: {exc}", file=sys.stderr)
 
     if not results:
-        print("No matches.")
-        return
+        print("No semantic results found (embedding backend may be offline).")
+        raise typer.Exit(code=0)
 
-    blocks: list[str] = []
-    for entity_id, score in results:
-        entity = read_entity(entity_id)
-        header = f"== {entity_id} (score={score:.3f}) =="
-        if entity is None:
-            # Index references an entity that no longer exists in the vault.
-            blocks.append(f"{header}\n(entity file missing from vault)")
-            continue
-        blocks.append(_format_entity_block(entity, header))
-    print("\n\n".join(blocks))
+    results.sort(key=lambda x: x[2], reverse=True)
+    results = results[:top_k]
+
+    for layer, item_id, score in results:
+        if layer == "concepts":
+            concept = read_concept(item_id)
+            if concept:
+                print(f"[{score:+.3f}] {_format_concept_block(concept)}")
+        else:
+            artifact = read_artifact(item_id)
+            if artifact:
+                print(f"[{score:+.3f}] {_format_artifact_block(artifact)}")
+        print()
 
 
 # ---------------------------------------------------------------------------
-# entity
+# concept
 # ---------------------------------------------------------------------------
 
 
-def _serialize_entity(entity: Entity) -> str:
-    """Re-render the entity as markdown (frontmatter + body) using python-frontmatter."""
-    import frontmatter  # local import — only this command needs it
-
-    post = frontmatter.Post(entity.body, **entity.frontmatter)
-    text = frontmatter.dumps(post)
-    if not text.endswith("\n"):
-        text += "\n"
-    return text
-
-
-def _signal_summary(signals: list[dict[str, Any]]) -> str:
-    if not signals:
-        return "(no signals recorded)"
-
-    first = signals[0]
-    last = signals[-1]
-
-    def _fmt(snap: dict[str, Any]) -> str:
-        return (
-            f"{snap.get('date', '?')}  "
-            f"stars={snap.get('stars', '?')} "
-            f"forks={snap.get('forks', '?')} "
-            f"commits_30d={snap.get('commits_30d', '?')}"
-        )
-
-    def _delta(field: str) -> str:
-        a = first.get(field)
-        b = last.get(field)
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            d = b - a
-            return f"{a}->{b} ({d:+d})" if isinstance(d, int) else f"{a}->{b} ({d:+.1f})"
-        return f"{a}->{b}"
-
-    lines = [
-        f"== Signals ({len(signals)} snapshots) ==",
-        f"First: {_fmt(first)}",
-        f"Last:  {_fmt(last)}",
-        f"Trend: stars {_delta('stars')}, commits_30d {_delta('commits_30d')}",
-    ]
-    return "\n".join(lines)
-
-
-@app.command("entity")
-def entity_cmd(
-    entity_id: str = typer.Argument(..., metavar="ID", help="Entity id (filename stem)."),
+@app.command()
+def concept(
+    concept_id: str = typer.Argument(..., help="Concept id."),
 ) -> None:
-    """Print the full entity markdown followed by a signal summary."""
-    entity = read_entity(entity_id)
-    if entity is None:
-        print(f"Entity {entity_id!r} not found.", file=sys.stderr)
+    """Display a concept file in full."""
+    c = read_concept(concept_id)
+    if c is None:
+        print(f"ERROR: concept {concept_id!r} not found.", file=sys.stderr)
         raise typer.Exit(code=1)
-
-    print(_serialize_entity(entity), end="")
+    fm = c.frontmatter
+    print(f"# {fm.get('label', concept_id)}  [{fm.get('status', '?')}]")
+    print(f"id={concept_id}  first_seen={fm.get('first_seen','?')}  last_evaluated={fm.get('last_evaluated','?')}")
+    print(f"relevance={fm.get('relevance','?')}  tags={_tags_str(fm)}")
+    artifact_entries = fm.get("artifacts") or []
+    if artifact_entries:
+        print(f"\nArtifacts ({len(artifact_entries)}):")
+        for entry in artifact_entries:
+            if isinstance(entry, dict):
+                print(f"  - {entry.get('id')}  ({entry.get('relationship','?')}, {entry.get('weight','?')})")
     print()
-    print(_signal_summary(read_signals(entity_id)))
+    print(c.body)
+
+
+# ---------------------------------------------------------------------------
+# artifact
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def artifact(
+    artifact_id: str = typer.Argument(..., help="Artifact id."),
+) -> None:
+    """Display an artifact file in full."""
+    a = read_artifact(artifact_id)
+    if a is None:
+        print(f"ERROR: artifact {artifact_id!r} not found.", file=sys.stderr)
+        raise typer.Exit(code=1)
+    fm = a.frontmatter
+    print(f"# artifact:{artifact_id}  [{fm.get('evaluation','?')}]")
+    print(f"type={fm.get('type','?')}  concept={fm.get('concept','?')}  relationship={fm.get('relationship','?')}")
+    print(f"first_seen={fm.get('first_seen','?')}  last_evaluated={fm.get('last_evaluated','?')}")
+    if fm.get("github_repo"):
+        print(f"github: https://github.com/{fm['github_repo']}")
+    print(f"tags={_tags_str(fm)}")
+    print()
+    print(a.body)
 
 
 # ---------------------------------------------------------------------------
@@ -228,46 +242,28 @@ def entity_cmd(
 # ---------------------------------------------------------------------------
 
 
-_DELTA_FIELDS = ("stars", "forks", "commits_30d", "open_issues")
-
-
-def _format_delta_line(curr: dict[str, Any], prev: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for field in _DELTA_FIELDS:
-        a = prev.get(field)
-        b = curr.get(field)
-        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-            diff = b - a
-            if isinstance(diff, int):
-                parts.append(f"{field}={diff:+d}")
-            else:
-                parts.append(f"{field}={diff:+.1f}")
-    delta_str = ", ".join(parts) if parts else "(no numeric deltas)"
-    return f"  delta: {delta_str}   (vs. {prev.get('date', '?')})"
-
-
-@app.command("signals")
-def signals_cmd(
-    entity_id: str = typer.Argument(..., metavar="ID", help="Entity id."),
+@app.command()
+def signals(
+    artifact_id: str = typer.Argument(..., help="Artifact id to show signals for."),
+    last: int = typer.Option(20, "--last", help="Number of most recent signals to show."),
 ) -> None:
-    """Print each signal snapshot as one JSON line, with deltas vs. the previous one."""
-    import json
-
-    if not vault.entity_exists(entity_id):
-        print(f"Entity {entity_id!r} not found.", file=sys.stderr)
-        raise typer.Exit(code=1)
-
-    signals = read_signals(entity_id)
-    if not signals:
-        print("(no signals recorded)")
-        return
-
-    prev: dict[str, Any] | None = None
-    for snap in signals:
-        print(json.dumps(snap, ensure_ascii=False, sort_keys=False))
-        if prev is not None:
-            print(_format_delta_line(snap, prev))
-        prev = snap
+    """Show signal history for an artifact."""
+    rows = read_signals(artifact_id)
+    if not rows:
+        print(f"No signals found for {artifact_id!r}")
+        raise typer.Exit(code=0)
+    rows = rows[-last:]
+    print(f"signals for {artifact_id} (showing last {len(rows)}):\n")
+    for row in rows:
+        parts: list[str] = [row.get("date", "?")]
+        for key in ("stars", "forks", "commits_30d", "open_issues", "evaluation"):
+            val = row.get(key)
+            if val is not None:
+                parts.append(f"{key}={val}")
+        src = row.get("source")
+        if src:
+            parts.append(f"[{src}]")
+        print("  " + "  ".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -275,97 +271,98 @@ def signals_cmd(
 # ---------------------------------------------------------------------------
 
 
-@app.command("digest")
-def digest_cmd(
-    last: int = typer.Option(14, "--last", help="Window in days to include."),
+@app.command()
+def digest(
+    last: int = typer.Option(1, "--last", help="Number of recent digests to show."),
 ) -> None:
-    """Print recent digests (newest first) within the last N days."""
-    if last < 1:
-        print("ERROR: --last must be >= 1.", file=sys.stderr)
-        raise typer.Exit(code=1)
-
-    digests = read_recent_digests(within_days=last)
+    """Show recent weekly digests."""
+    digests = read_recent_digests(n=last)
     if not digests:
-        print(f"No digests within the last {last} days.")
-        return
-
-    for date_iso, body in digests:
-        print(f"== Digest {date_iso} ==")
-        print(body, end="" if body.endswith("\n") else "\n")
+        print("No digests found.")
+        raise typer.Exit(code=0)
+    for date_iso, content in digests:
+        print(f"{'='*60}")
+        print(f"Digest: {date_iso}")
+        print(f"{'='*60}")
+        print(content)
         print()
 
 
 # ---------------------------------------------------------------------------
-# list
+# list-concepts
 # ---------------------------------------------------------------------------
 
 
-def _format_row(cols: list[str], widths: list[int]) -> str:
-    pieces: list[str] = []
-    for i, (col, w) in enumerate(zip(cols, widths)):
-        if i == len(cols) - 1:
-            # Last column: don't pad — tags can be long.
-            pieces.append(col)
-        else:
-            pieces.append(col.ljust(w))
-    return "  ".join(pieces)
-
-
-@app.command("list")
-def list_cmd(
-    status: str | None = typer.Option(None, "--status", help="Filter by status."),
-    type_: str | None = typer.Option(None, "--type", help="Filter by type."),
+@app.command(name="list-concepts")
+def list_concepts_cmd(
+    status: str | None = typer.Option(None, "--status", help="Filter by lifecycle status."),
 ) -> None:
-    """List entities filtered by status and/or type."""
-    entities = list_entities(status=status, type_=type_)
-    # list_entities already sorts by id (filename stem). Keep that.
-
-    headers = ["ID", "TYPE", "STATUS", "RELEVANCE", "LAST_EVALUATED", "TAGS"]
-    rows: list[list[str]] = []
-    for entity in entities:
-        fm = entity.frontmatter
-        rows.append(
-            [
-                entity.id,
-                str(fm.get("type", "")),
-                str(fm.get("status", "")),
-                str(fm.get("relevance", "")),
-                str(fm.get("last_evaluated", "")),
-                ", ".join(_tags(entity)),
-            ]
+    """List all concepts, optionally filtered by status."""
+    concepts = list_concepts(status=status)
+    if not concepts:
+        msg = f"No concepts with status={status!r}" if status else "No concepts in vault"
+        print(msg)
+        return
+    header = f"{'ID':<40} {'STATUS':<12} {'RELEVANCE':<10} {'ARTIFACTS'}"
+    print(header)
+    print("-" * len(header))
+    for c in concepts:
+        fm = c.frontmatter
+        n_arts = len(fm.get("artifacts") or [])
+        print(
+            f"{c.id:<40} {fm.get('status', '?'):<12} "
+            f"{fm.get('relevance', '?'):<10} {n_arts}"
         )
 
-    if not rows:
-        # Still print the header so the output shape is predictable, then a note.
-        print("  ".join(headers))
-        filters = []
-        if status is not None:
-            filters.append(f"status={status}")
-        if type_ is not None:
-            filters.append(f"type={type_}")
-        suffix = f" matching {' '.join(filters)}" if filters else ""
-        print(f"(no entities{suffix})")
+
+# ---------------------------------------------------------------------------
+# list-artifacts
+# ---------------------------------------------------------------------------
+
+
+@app.command(name="list-artifacts")
+def list_artifacts_cmd(
+    evaluation: str | None = typer.Option(None, "--evaluation", help="Filter by evaluation."),
+    type_: str | None = typer.Option(None, "--type", metavar="TYPE", help="Filter by artifact type."),
+    concept_id: str | None = typer.Option(None, "--concept", help="Filter by concept id."),
+) -> None:
+    """List artifacts, optionally filtered by evaluation/type/concept."""
+    artifacts = list_artifacts(
+        evaluation=evaluation, artifact_type=type_, concept_id=concept_id
+    )
+    if not artifacts:
+        print("No artifacts matched the filters.")
         return
-
-    # Compute column widths from header + data (skip last column — tags free-form).
-    widths: list[int] = []
-    for col_idx, header in enumerate(headers):
-        if col_idx == len(headers) - 1:
-            widths.append(len(header))
-            continue
-        w = len(header)
-        for row in rows:
-            w = max(w, len(row[col_idx]))
-        widths.append(w)
-
-    print(_format_row(headers, widths))
-    for row in rows:
-        print(_format_row(row, widths))
+    header = f"{'ID':<45} {'TYPE':<8} {'EVAL':<12} {'CONCEPT'}"
+    print(header)
+    print("-" * len(header))
+    for a in artifacts:
+        fm = a.frontmatter
+        print(
+            f"{a.id:<45} {fm.get('type', '?'):<8} "
+            f"{fm.get('evaluation', '?'):<12} {fm.get('concept', '?')}"
+        )
 
 
 # ---------------------------------------------------------------------------
-# entry point
+# pending
 # ---------------------------------------------------------------------------
+
+
+@app.command()
+def pending() -> None:
+    """List concepts flagged with review_needed=true."""
+    flagged = [
+        c for c in list_concepts()
+        if c.frontmatter.get("review_needed")
+    ]
+    if not flagged:
+        print("No concepts flagged for review.")
+        return
+    print(f"Concepts needing review ({len(flagged)}):\n")
+    for c in flagged:
+        fm = c.frontmatter
+        print(f"  {c.id}  [{fm.get('status','?')}]  {fm.get('label', '')}")
 
 
 if __name__ == "__main__":

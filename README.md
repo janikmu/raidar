@@ -5,17 +5,21 @@ knowledge about the AI tooling landscape from URLs, notes, and scheduled
 GitHub signal pulls.
 
 This repo is the **tool**. The knowledge vault is a separate private repo
-(default: `~/source/ai-radar-vault`), configured in `config.yaml`.
+(default: `~/raidar-vault`), configured in `config.yaml`.
+
+The vault uses a **two-layer knowledge model**:
+1. **Concepts**: Intellectual ideas (e.g., `multi-agent-frameworks`) with a lifecycle status (`emerging`, `watch`, `invest`, `common`, `superseded`, `abandoned`).
+2. **Artifacts**: Evidence pieces (GitHub repos, papers, blog posts) mapped to a concept, with an evaluation status (`new`, `promising`, `recommended`, `deprecated`, `hype`).
 
 ## Architecture in one breath
 
 - **Three jobs**: `capture` (on-demand), `enrich` (Sunday 20:00 via launchd),
   `digest` (Sunday 21:00 via launchd). Each is `python -m jobs.<name>`.
 - **One CLI for querying**: `python -m jobs.search` with subcommands
-  (`keyword | semantic | entity | signals | digest | list`).
+  (`keyword | semantic | concept | artifact | signals | digest | list-concepts | list-artifacts | pending`).
 - **One LLM router** (`lib/llm.py`) routes per-task to a configured chain of
   OpenAI-wire-compatible providers (academic proxy → local LMStudio fallback).
-- **Local embeddings** via LMStudio (any OpenAI-compatible embedding model), flat JSON index, numpy cosine.
+- **Local embeddings** via LMStudio (any OpenAI-compatible embedding model), flat JSON indexes, numpy cosine.
 - **No databases**. Markdown + JSONL + JSON, all git-friendly.
 
 ## Quickstart
@@ -63,11 +67,12 @@ bash infra/smoke.sh
 You want to see "0 fail". Skips are fine if LMStudio isn't running yet — re-run
 once the server is up with both models loaded to exercise the full path.
 
-### 5. Capture your first entity
+### 5. Capture your first artifact
 
 ```bash
 uv run python -m jobs.capture https://github.com/some-org/some-tool
-uv run python -m jobs.search entity <id-the-capture-printed>
+uv run python -m jobs.search concept <concept-id-the-capture-printed>
+uv run python -m jobs.search artifact <artifact-id-the-capture-printed>
 ```
 
 ### 6. Install scheduled jobs
@@ -92,16 +97,21 @@ report back.
 ```
 ai-radar-tool/                    (this repo)
   jobs/
-    capture.py                    on-demand capture (URL or text -> entity)
-    enrich.py                     weekly signal refresh + LLM re-evaluation
+    capture.py                    on-demand capture (URL or text -> artifact + concept)
+    bulk_capture.py               bulk capture from awesome-lists and newsletter pages
+    enrich.py                     weekly signal refresh + LLM re-evaluation (two passes)
     digest.py                     weekly markdown digest
-    search.py                     CLI: keyword / semantic / entity / signals / digest / list
+    backfill.py                   bulk star-history backfill for artifacts
+    reevaluate.py                 force re-evaluation of artifacts with full signal history
+    seed.py                       seed canonical concepts from training-data knowledge
+    search.py                     CLI: query concepts, artifacts, signals, digests
+    cli.py                        unified `raidar` entry point
   lib/
-    vault.py                      atomic file I/O for entities, signals, digests
+    vault.py                      atomic file I/O for concepts, artifacts, signals, digests
     llm.py                        OpenAI-compatible router with per-task chains + retry
-    embeddings.py                 Ollama embeddings + flat numpy index
+    embeddings.py                 Ollama embeddings + split numpy indexes
     github.py                     GitHub API client (httpx + tenacity)
-    entity_body.py                canonical entity body renderer/parser
+    body.py                       canonical body renderer/parser for concepts and artifacts
     config.py                     config.yaml loader
     secrets.py                    .env / env-var access
     logging_setup.py              logging configured once per process
@@ -114,11 +124,13 @@ ai-radar-tool/                    (this repo)
   SKILL.md                        Cowork integration instructions
   .env                            local secrets (gitignored)
 
-ai-radar-vault/                   (separate private repo at ~/source/ai-radar-vault)
-  entities/<id>.md                YAML frontmatter + markdown body, one per entity
+ai-radar-vault/                   (separate private repo at ~/raidar-vault)
+  concepts/<id>.md                YAML frontmatter + markdown body
+  artifacts/<id>.md               YAML frontmatter + markdown body
   signals/<id>.jsonl              append-only weekly snapshots, one JSON per line
   digests/YYYY-MM-DD.md           weekly digests
-  embeddings/index.json           flat embedding index
+  embeddings/concepts.json        embedding index for concepts
+  embeddings/artifacts.json       embedding index for artifacts
 ```
 
 ## How the LLM router routes
@@ -140,26 +152,12 @@ through to the next provider. Running out of providers raises
 
 ## Editing the vault by hand
 
-Entity files are plain markdown. You can edit `## Current assessment` directly,
-or flip `status:` in the frontmatter, or remove a tag — the tool reads from
+Concept and Artifact files are plain markdown. You can edit `## Current assessment` directly,
+or flip `status:` / `evaluation:` in the frontmatter, or remove a tag — the tool reads from
 disk on every call, so changes take effect immediately. `signals/` and
 `embeddings/` are tool-owned; don't edit those by hand.
 
-## Build status
+## Out of scope
 
-| Task | Module | Status |
-| --- | --- | --- |
-| 0 | scaffold + config | done |
-| 1 | `lib/vault.py` | done |
-| 2 | `lib/llm.py` | done |
-| 3 | `lib/embeddings.py` | done |
-| 4 | `lib/github.py` | done |
-| 5 | `jobs/capture.py` | done |
-| 6 | `jobs/enrich.py` | done |
-| 7 | `jobs/digest.py` | done |
-| 8 | `jobs/search.py` | done |
-| 9 | launchd + SKILL.md | done |
-| 10 | smoke test + docs | done |
-
-V1 explicitly out of scope: email capture, arXiv ingest, social-media scraping,
-web UI, multi-user. See the original spec for rationale.
+Email capture, arXiv ingest, social-media scraping, web UI, multi-user. See
+the original spec for rationale.

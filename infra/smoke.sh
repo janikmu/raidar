@@ -60,8 +60,8 @@ check "lib.vault imports" uv run python -c "from lib import vault"
 check "lib.llm imports"   uv run python -c "from lib import llm"
 check "lib.embeddings imports" uv run python -c "from lib import embeddings"
 check "lib.github imports" uv run python -c "from lib import github"
-check "lib.entity_body imports" uv run python -c "from lib import entity_body"
-check "all jobs import"   uv run python -c "from jobs import capture, enrich, digest, search"
+check "lib.body imports" uv run python -c "from lib import body"
+check "all jobs import"   uv run python -c "from jobs import capture, bulk_capture, enrich, digest, search, backfill, reevaluate, seed, cli"
 
 echo "[lib smoke tests]"
 check "lib.vault smoke" uv run python -m lib.vault
@@ -70,11 +70,16 @@ check_skip_ok "lib.llm smoke" uv run python -m lib.llm
 check "lib.github smoke (uses network)" uv run python -m lib.github
 
 echo "[CLI wiring]"
+check "raidar --help"  uv run raidar --help
 check "capture --help" uv run python -m jobs.capture --help
 check "enrich --help"  uv run python -m jobs.enrich --help
 check "digest --help"  uv run python -m jobs.digest --help
 check "search --help"  uv run python -m jobs.search --help
-check "search list against empty vault" uv run python -m jobs.search list
+check "backfill --help" uv run python -m jobs.backfill --help
+check "reevaluate --help" uv run python -m jobs.reevaluate --help
+check "seed --help"    uv run python -m jobs.seed --help
+check "seed --list (no LLM)" uv run python -m jobs.seed --list
+check "search list-concepts against empty vault" uv run python -m jobs.search list-concepts
 
 echo "[capture dry-run]"
 check "capture --dry-run on free text" \

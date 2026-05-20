@@ -1,105 +1,127 @@
-"""Weekly enrich job for AI Radar.
+"""Weekly enrich job for AI Radar — two-pass evaluation.
 
-For every entity in `status in {emerging, watch}`:
+Pass 1 — Artifact signal refresh + re-evaluation:
+  For every artifact with type=repo and evaluation != deprecated/hype:
+    1. Fetch fresh GitHub snapshot, append to signals/{id}.jsonl.
+    2. Compute deltas vs previous snapshot.
+    3. LLM evaluates: should evaluation change? Should prose change?
+    4. Apply changes: frontmatter, Evaluation rationale, History, embedding.
 
-  1. Pull a fresh GitHub snapshot (if a `github_repo` is set) and append it
-     to `signals/{id}.jsonl`.
-  2. Compute deltas vs. the previous snapshot.
-  3. Ask the LLM ("enrichment" task chain) whether the status should change
-     and/or the prose should be rewritten, given full context + signal history.
-  4. Apply changes — frontmatter mutation, body re-render, history bullet,
-     embedding refresh.
-  5. Write a summary JSON for the digest job and print a terse stdout summary.
+Pass 2 — Concept lifecycle re-evaluation:
+  For every concept with status in {emerging, watch}:
+    1. Gather all linked artifacts + their current evaluations + signal summaries.
+    2. LLM evaluates: should lifecycle status change?
+    3. Apply changes: frontmatter, Current assessment, Artifact summary table, History.
 
-A failure on a single entity is captured and the batch continues — one
-unreachable repo or one rate-limited LLM should not poison the rest. We
-deliberately do NOT touch `status in {adopt, skip, settled}` here: `adopt`
-needs human signal, the other two are done.
+Terminal concept suppression: artifacts whose concept is common/superseded/abandoned
+are skipped in Pass 1 unless a new artifact was recently added.
 
 Run modes:
-
-    raidar enrich               # full pass
-    raidar enrich --only ID     # single entity (testing)
-    raidar enrich --dry-run     # no writes, plan only
-
-`--dry-run` performs every read step (fetch, delta compute, LLM eval) but
-skips the four mutating sinks: `append_signal`, `write_entity`,
-`append_history`, `Index.upsert`, and the enrich-output JSON. When the LLM
-isn't configured (offline dev), `--dry-run` still exercises fetch + delta
-compute and prints a clear "LLM not configured" line.
+    uv run python -m jobs.enrich               # full two-pass
+    uv run python -m jobs.enrich --only ID     # single artifact (testing; skips concept pass)
+    uv run python -m jobs.enrich --dry-run     # no writes, LLM still called
+    uv run python -m jobs.enrich --concepts-only  # skip Pass 1, only re-evaluate concepts
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
+
+import typer
 
 from lib import config as config_module
 from lib import vault
 from lib.embeddings import Index
-from lib.entity_body import HISTORY, parse, render
+from lib.body import parse, parse_artifact, parse_concept, render_artifact, render_concept
 from lib.github import (
-    RepoSnapshot, TerminalError, fetch_repo, fetch_star_history,
-    get_rate_limit_remaining, parse_repo_url,
+    RepoSnapshot,
+    TerminalError,
+    fetch_repo,
+    fetch_star_history,
+    get_rate_limit_remaining,
+    parse_repo_url,
 )
 from lib.llm import AllProvidersFailed, Router
 from lib.logging_setup import setup as setup_logging
-from lib.vault import Entity
+from lib.vault import Artifact, Concept
 
 log = logging.getLogger("jobs.enrich")
-
+app = typer.Typer(add_completion=False, help=__doc__)
 
 # ---------------------------------------------------------------------------
-# Schema for the LLM response.
+# LLM schemas
 # ---------------------------------------------------------------------------
 
-_STATUSES = ["emerging", "watch", "adopt", "skip", "settled"]
+_EVALUATIONS = ["new", "promising", "recommended", "deprecated", "hype"]
+_CONCEPT_STATUSES = ["emerging", "watch", "invest", "common", "superseded", "abandoned"]
 
-_RESPONSE_SCHEMA: dict[str, Any] = {
+_ARTIFACT_EVAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["evaluation_changed", "new_evaluation", "prose_changed", "rationale"],
+    "properties": {
+        "evaluation_changed": {"type": "boolean"},
+        "new_evaluation": {"type": "string", "enum": _EVALUATIONS},
+        "prose_changed": {"type": "boolean"},
+        "new_what_it_is": {"type": ["string", "null"]},
+        "new_evaluation_rationale": {"type": ["string", "null"]},
+        "rationale": {"type": "string"},
+    },
+}
+
+_ARTIFACT_SYSTEM = (
+    "You are the curator of an AI-tooling research radar. You are reviewing one artifact "
+    "given its signal history and the researcher's context. "
+    "Assign an evaluation status based on evidence quality, not just star count. "
+    "evaluation='recommended': mature, actively maintained, strong community or org backing, worth adopting. "
+    "evaluation='promising': clear value, growing traction, not yet proven at scale. "
+    "evaluation='hype': thin community, self-reported benchmarks, no substantial adoption. "
+    "evaluation='deprecated': archived, abandoned, or superseded by something better. "
+    "evaluation='new': insufficient signal to judge. "
+    "Only change prose when something materially changed (evaluation flip, big signal move, archived). "
+    "Return JSON matching the provided schema."
+)
+
+_CONCEPT_EVAL_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": ["status_changed", "new_status", "prose_changed", "rationale"],
     "properties": {
         "status_changed": {"type": "boolean"},
-        "new_status": {"type": "string", "enum": _STATUSES},
+        "new_status": {"type": "string", "enum": _CONCEPT_STATUSES},
         "prose_changed": {"type": "boolean"},
-        "new_what_it_is": {"type": ["string", "null"]},
-        "new_why_it_matters": {"type": ["string", "null"]},
         "new_current_assessment": {"type": ["string", "null"]},
         "rationale": {"type": "string"},
     },
 }
 
-_SYSTEM_PROMPT = (
-    "You are the curator of an Information Systems researcher's personal "
-    "AI-tooling watchlist. You are reviewing one entity given the user's "
-    "context, current entity prose, full signal history, and recent deltas. "
-    "Use the star history (backfill signals) as ground truth for age and "
-    "growth trajectory — a repo with years of history and thousands of stars "
-    "should NOT stay 'emerging'. "
-    "Status heuristics: 'emerging' for < 6 months old or < 300 stars; "
-    "'watch' for 6 months–2 years old or 300–5k stars; "
-    "'adopt' for > 2 years old AND > 5k stars, or tools in broad production use. "
-    "Only rewrite prose when something materially changed (status flip, big "
-    "signal move, repo archived, scope shift). "
+_CONCEPT_SYSTEM = (
+    "You are the curator of an AI-tooling research radar. You are reviewing one concept "
+    "given all its artifacts and their current evaluations. "
+    "Lifecycle rules: "
+    "'emerging' = concept is new or unclear trajectory; "
+    "'watch' = concept is gaining traction, multiple implementations, at least one 'promising'; "
+    "'invest' = concept has at least one 'recommended' artifact, is proven in production; "
+    "'common' = stable and widespread — table-stakes, no need to track further; "
+    "'superseded' = a better approach replaced this concept (note what replaced it in rationale); "
+    "'abandoned' = community dissolved, no active implementations. "
+    "Status is driven by artifact quality, not just quantity. "
+    "Update current_assessment only when the status changes or the landscape materially shifted. "
     "Return JSON matching the provided schema."
 )
 
-
 # ---------------------------------------------------------------------------
-# Result types.
+# Delta and result types (reused from pre-migration enrich)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class _Deltas:
-    """Per-entity signal deltas, all optional (None on first run)."""
-
     stars_delta: int | None
     forks_delta: int | None
     commits_30d_delta: int | None
@@ -115,17 +137,32 @@ class _Deltas:
 
 
 @dataclass
-class _EntityResult:
+class _ArtifactResult:
     id: str
     evaluated: bool = False
-    moved: dict[str, Any] | None = None        # {"from": ..., "to": ..., "rationale": ...}
+    moved: dict[str, Any] | None = None          # {from, to, rationale}
     prose_updated: bool = False
-    significant_change: dict[str, Any] | None = None  # {"deltas": {...}}
+    significant_change: dict[str, Any] | None = None
     error: str | None = None
 
 
+@dataclass
+class _ConceptResult:
+    id: str
+    evaluated: bool = False
+    moved: dict[str, Any] | None = None          # {from, to, rationale}
+    prose_updated: bool = False
+    error: str | None = None
+
+
+@dataclass
+class _EnrichOutput:
+    artifact_results: list[_ArtifactResult] = field(default_factory=list)
+    concept_results: list[_ConceptResult] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
-# Helpers.
+# Signal + delta helpers
 # ---------------------------------------------------------------------------
 
 
@@ -138,7 +175,6 @@ def _significant(
     prev: dict[str, Any] | None,
     thresholds: dict[str, Any],
 ) -> bool:
-    """Apply config thresholds to determine if a signal change is "notable"."""
     if prev is None:
         return False
     sig_cfg = thresholds.get("signal_change", {}) if thresholds else {}
@@ -154,18 +190,18 @@ def _significant(
         deltas.stars_delta is not None
         and isinstance(prev_stars, (int, float))
         and prev_stars > 0
+        and (deltas.stars_delta / prev_stars * 100) >= rel_star_pct
     ):
-        if (deltas.stars_delta / prev_stars * 100) >= rel_star_pct:
-            return True
+        return True
 
     prev_commits = prev.get("commits_30d")
     if (
         deltas.commits_30d_delta is not None
         and isinstance(prev_commits, (int, float))
         and prev_commits > 0
+        and abs(deltas.commits_30d_delta / prev_commits * 100) >= rel_commits_pct
     ):
-        if abs(deltas.commits_30d_delta / prev_commits * 100) >= rel_commits_pct:
-            return True
+        return True
 
     return False
 
@@ -191,26 +227,21 @@ def _compute_deltas(
     )
 
 
-def _snapshot_from_repo(
-    repo: RepoSnapshot, status: str, today: str
-) -> dict[str, Any]:
+def _snapshot_from_repo(repo: RepoSnapshot, evaluation: str, today: str) -> dict[str, Any]:
     return {
         "date": today,
         "stars": repo.stars,
         "forks": repo.forks,
         "commits_30d": repo.commits_30d,
         "open_issues": repo.open_issues,
-        "status": status,
+        "evaluation": evaluation,
         "source": "enrich",
     }
 
 
 def _extract_history_bullets(body: str) -> list[str]:
-    """Return the History section bullets (text after '- '), preserving order."""
     sections = parse(body)
-    hist_block = sections.get(HISTORY, "")
-    if not hist_block.strip():
-        return []
+    hist_block = sections.get("History", "")
     out: list[str] = []
     for line in hist_block.splitlines():
         s = line.strip()
@@ -221,436 +252,512 @@ def _extract_history_bullets(body: str) -> list[str]:
     return out
 
 
-def _build_prompt(
+def has_star_history_backfill(artifact_id: str) -> bool:
+    """Return True if the signal file has any entry with source='backfill'."""
+    signals = vault.read_signals(artifact_id)
+    return any(s.get("source") == "backfill" for s in signals)
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: Artifact enrichment
+# ---------------------------------------------------------------------------
+
+
+def _build_artifact_prompt(
     context_md: str,
-    entity: Entity,
+    artifact: Artifact,
     signals_tail: list[dict[str, Any]],
     deltas: _Deltas,
     significant: bool,
 ) -> str:
-    """Assemble the user-side prompt for the LLM. Stable formatting matters
-    less than completeness — the LLM is reading this in one shot."""
-    fm_dump = json.dumps(entity.frontmatter, indent=2, sort_keys=True, default=str)
+    fm_dump = json.dumps(artifact.frontmatter, indent=2, sort_keys=True, default=str)
     signals_dump = json.dumps(signals_tail, indent=2, default=str)
     deltas_dump = json.dumps(deltas.as_dict(), indent=2)
-
     return (
         "# Researcher context\n"
         f"{context_md.strip()}\n\n"
-        "# Entity under review\n"
+        "# Artifact under review\n"
         f"## frontmatter\n```json\n{fm_dump}\n```\n\n"
-        f"## body\n{entity.body.strip()}\n\n"
+        f"## body\n{artifact.body.strip()}\n\n"
         "# Signal history (most recent last)\n"
         f"```json\n{signals_dump}\n```\n\n"
-        "# Deltas (current vs. previous snapshot)\n"
+        "# Deltas (current vs previous snapshot)\n"
         f"```json\n{deltas_dump}\n```\n"
         f"significant_change_flag: {significant}\n\n"
         "# Task\n"
-        "Decide whether the entity's status should change and/or whether the "
-        "prose sections (`What it is`, `Why it matters`, `Current "
-        "assessment`) should be rewritten. Status options: "
-        f"{', '.join(_STATUSES)}. Return JSON per the schema. "
-        "If status_changed is false, set new_status to the current status. "
-        "If prose_changed is false, you may leave the three new_* prose fields null. "
-        "Keep prose terse — one short paragraph per section."
+        "Evaluate this artifact. If evaluation_changed, set new_evaluation. "
+        "If prose_changed, provide new_what_it_is and/or new_evaluation_rationale. "
+        "Keep prose terse — 2-3 sentences per section. "
+        "Return JSON per the schema."
     )
 
 
-def _format_planned_change(
-    entity_id: str,
-    parsed: dict[str, Any],
-    deltas: _Deltas,
-    significant: bool,
-    current_status: str,
-) -> str:
-    bits = [f"[plan] {entity_id}:"]
-    if parsed.get("status_changed"):
-        bits.append(f"status {current_status} -> {parsed.get('new_status')!r}")
-    else:
-        bits.append(f"status unchanged ({current_status})")
-    if parsed.get("prose_changed"):
-        changed = [
-            name for name, key in (
-                ("what_it_is", "new_what_it_is"),
-                ("why_it_matters", "new_why_it_matters"),
-                ("current_assessment", "new_current_assessment"),
-            ) if parsed.get(key)
-        ]
-        bits.append("prose rewrite: " + (", ".join(changed) if changed else "(empty)"))
-    else:
-        bits.append("prose unchanged")
-    if significant:
-        bits.append(f"significant deltas={deltas.as_dict()}")
-    rationale = parsed.get("rationale", "")
-    if rationale:
-        bits.append(f"rationale={rationale!r}")
-    return " | ".join(bits)
-
-
-# ---------------------------------------------------------------------------
-# Core per-entity step.
-# ---------------------------------------------------------------------------
-
-
-def _process_entity(
-    entity: Entity,
+def _enrich_artifact(
+    artifact: Artifact,
     *,
-    cfg: config_module.Config,
+    router: Router,
     context_md: str,
-    router: Router | None,
+    thresholds: dict[str, Any],
+    artifact_index: Index,
+    today: str,
     dry_run: bool,
-    index: Index | None,
-) -> _EntityResult:
-    """Process one entity end-to-end. Caller wraps in try/except."""
-    today = _today_iso()
-    result = _EntityResult(id=entity.id)
-    current_status = entity.frontmatter.get("status", "unknown")
+) -> _ArtifactResult:
+    result = _ArtifactResult(id=artifact.id)
+    fm = artifact.frontmatter
+    github_repo = fm.get("github_repo")
 
-    # ---- 1. GitHub fetch + signal append --------------------------------
-    new_snap: dict[str, Any] | None = None
-    github_repo = entity.frontmatter.get("github_repo")
+    # --- 1. GitHub fetch --------------------------------------------------
+    snap: RepoSnapshot | None = None
     if github_repo:
-        parsed_repo = parse_repo_url(str(github_repo))
-        if parsed_repo is None:
-            log.warning("%s: github_repo=%r not parseable; skipping fetch", entity.id, github_repo)
-        else:
-            owner, name = parsed_repo
+        parsed_url = parse_repo_url(github_repo)
+        if parsed_url:
+            owner, name = parsed_url
+            rl = get_rate_limit_remaining()
+            if rl is not None and rl <= 200:
+                result.error = f"rate_limit_remaining={rl}; skipping"
+                return result
             try:
-                repo = fetch_repo(owner, name)
+                snap = fetch_repo(owner, name)
             except TerminalError as exc:
-                log.error("%s: GitHub TerminalError on %s/%s: %s", entity.id, owner, name, exc)
                 result.error = f"github terminal: {exc}"
                 return result
-            if repo is None:
-                log.warning("%s: GitHub returned 404 for %s/%s", entity.id, owner, name)
-                if not dry_run:
-                    try:
-                        vault.append_history(entity.id, "Repo unreachable on enrich (404).", entry_date=today)
-                    except Exception as exc:  # pragma: no cover - defensive
-                        log.error("%s: failed to append 404-history: %s", entity.id, exc)
-                # Continue without a new snapshot. Don't treat as fatal.
-            else:
-                new_snap = _snapshot_from_repo(repo, current_status, today)
-                # ---- 1.5. Auto-backfill star history on first enrich --------
-                # Skip if already backfilled; only proceed when rate limit is healthy.
-                if not vault.has_star_history_backfill(entity.id):
-                    rl = get_rate_limit_remaining()
-                    if rl is None or rl > 300:
-                        try:
-                            history = fetch_star_history(owner, name, repo.stars)
-                            if history and not dry_run:
-                                for star_count, starred_at in history:
-                                    vault.append_signal(entity.id, {
-                                        "date": starred_at[:10],
-                                        "stars": star_count,
-                                        "source": "backfill",
-                                    })
-                                log.info(
-                                    "%s: backfilled %d star history points",
-                                    entity.id, len(history),
-                                )
-                        except Exception as exc:
-                            log.warning("%s: star history backfill failed: %s", entity.id, exc)
-                    else:
-                        log.info(
-                            "%s: skipping backfill (rate_limit_remaining=%d)", entity.id, rl
-                        )
 
-    # ---- 2. Persist new snapshot ----------------------------------------
-    if new_snap is not None and not dry_run:
-        vault.append_signal(entity.id, new_snap)
+    # --- 2. Compute deltas ------------------------------------------------
+    signals = vault.read_signals(artifact.id)
+    # Auto-backfill star history on first enrich
+    if snap and not has_star_history_backfill(artifact.id) and not dry_run:
+        log.info("auto-backfilling star history for %s", artifact.id)
+        try:
+            history = fetch_star_history(*parse_repo_url(github_repo), snap.stars)
+            for star_count, starred_at in history:
+                vault.append_signal(artifact.id, {
+                    "date": starred_at[:10],
+                    "stars": star_count,
+                    "source": "backfill",
+                })
+            signals = vault.read_signals(artifact.id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("star history backfill failed for %s: %s", artifact.id, exc)
 
-    # ---- 3. Compute deltas against previous snapshot --------------------
-    # `read_signals` reflects what's currently on disk. After append_signal
-    # the just-written snapshot is the last entry; in --dry-run it's not on
-    # disk so we splice it in for delta math.
-    history_signals = vault.read_signals(entity.id)
-    if dry_run and new_snap is not None:
-        history_signals = history_signals + [new_snap]
+    # Filter out backfill signals for delta computation
+    real_signals = [s for s in signals if s.get("source") != "backfill"]
+    prev_snap = real_signals[-1] if real_signals else None
+    new_snap_dict: dict[str, Any] = {}
 
-    prev_snap: dict[str, Any] | None = None
-    if new_snap is not None and len(history_signals) >= 2:
-        prev_snap = history_signals[-2]
-    deltas = _compute_deltas(new_snap or {}, prev_snap) if new_snap is not None else _Deltas(None, None, None, None)
-    significant = _significant(deltas, prev_snap, cfg.thresholds)
+    if snap:
+        current_evaluation = fm.get("evaluation", "new")
+        new_snap_dict = _snapshot_from_repo(snap, current_evaluation, today)
+        if not dry_run:
+            vault.append_signal(artifact.id, new_snap_dict)
+
+    deltas = _compute_deltas(new_snap_dict, prev_snap)
+    significant = _significant(deltas, prev_snap, thresholds)
     if significant:
         result.significant_change = {"deltas": deltas.as_dict()}
 
-    # ---- 4. LLM evaluation ----------------------------------------------
-    if router is None:
-        log.info("%s: LLM not configured; skipping evaluation step", entity.id)
-        print(f"[dry-run] {entity.id}: LLM not configured; skipping evaluation step")
-        # Even in dry-run we want to surface that fetch + deltas ran.
-        if new_snap is not None:
-            print(f"[dry-run] {entity.id}: snapshot={new_snap}, deltas={deltas.as_dict()}, significant={significant}")
-        return result
-
-    # Adaptive tail: use full history for the first enrich pass per entity
-    # (backfill signals give crucial age/growth context); short tail for
-    # subsequent weekly updates where we only need recent momentum.
-    prior_enrich = [s for s in history_signals if s.get("source") == "enrich"]
-    signals_tail = history_signals if not prior_enrich else history_signals[-8:]
-    prompt = _build_prompt(context_md, entity, signals_tail, deltas, significant)
-
+    # --- 3. LLM evaluation ------------------------------------------------
+    signals_tail = signals[-24:]
+    prompt = _build_artifact_prompt(context_md, artifact, signals_tail, deltas, significant)
     try:
         completion = router.generate(
             task="enrichment",
             prompt=prompt,
-            system=_SYSTEM_PROMPT,
-            response_schema=_RESPONSE_SCHEMA,
-            max_tokens=2048,
+            system=_ARTIFACT_SYSTEM,
+            response_schema=_ARTIFACT_EVAL_SCHEMA,
+            max_tokens=1024,
         )
     except AllProvidersFailed as exc:
-        log.error("%s: LLM AllProvidersFailed: %s", entity.id, exc)
-        result.error = f"llm: {exc}"
+        result.error = f"llm failed: {exc}"
         return result
 
-    parsed_payload = completion.parsed
-    if not isinstance(parsed_payload, dict):
-        log.error("%s: LLM returned no parseable JSON; text=%r", entity.id, completion.text[:200])
+    parsed = completion.parsed
+    if not isinstance(parsed, dict):
         result.error = "llm: non-JSON response"
         return result
 
     result.evaluated = True
+    new_evaluation = parsed.get("new_evaluation", fm.get("evaluation", "new"))
+    evaluation_changed = bool(parsed.get("evaluation_changed", False))
+    prose_changed = bool(parsed.get("prose_changed", False))
 
-    status_changed = bool(parsed_payload.get("status_changed"))
-    new_status = parsed_payload.get("new_status") or current_status
-    if status_changed and new_status not in _STATUSES:
-        log.error("%s: LLM proposed invalid status %r; ignoring", entity.id, new_status)
-        status_changed = False
-        new_status = current_status
+    if evaluation_changed:
+        result.moved = {
+            "from": fm.get("evaluation"),
+            "to": new_evaluation,
+            "rationale": parsed.get("rationale", ""),
+        }
 
-    prose_changed = bool(parsed_payload.get("prose_changed"))
-    rationale = (parsed_payload.get("rationale") or "").strip()
+    # --- 4. Write changes -------------------------------------------------
+    if not dry_run and (evaluation_changed or prose_changed or snap):
+        sections = parse_artifact(artifact.body)
+        history_bullets = _extract_history_bullets(artifact.body)
 
-    # In dry-run, log the planned changes and stop short of writing.
-    if dry_run:
-        print(_format_planned_change(entity.id, parsed_payload, deltas, significant, current_status))
-        if status_changed:
-            result.moved = {"from": current_status, "to": new_status, "rationale": rationale}
-        if prose_changed:
-            result.prose_updated = True
-        return result
+        what_it_is = parsed.get("new_what_it_is") if prose_changed else sections.get("What it is", "")
+        eval_rationale = parsed.get("new_evaluation_rationale") if prose_changed else sections.get("Evaluation rationale", "")
 
-    # ---- 5. Apply mutations ---------------------------------------------
-    new_frontmatter = dict(entity.frontmatter)
-    new_frontmatter["last_evaluated"] = today
-    if status_changed:
-        new_frontmatter["status"] = new_status
+        if evaluation_changed:
+            history_bullets.append(
+                f"{today}: evaluation {fm.get('evaluation')} → {new_evaluation}. "
+                f"{parsed.get('rationale', '')[:120]}"
+            )
+        elif prose_changed:
+            history_bullets.append(f"{today}: Prose updated.")
 
-    new_body = entity.body
-    if prose_changed:
-        # Preserve the existing history bullets verbatim; the bullet we append
-        # below for this evaluation goes through append_history afterwards so
-        # we don't need to inline it into the rendered body.
-        section_map = parse(entity.body)
-        old_what = section_map.get("What it is", "")
-        old_why = section_map.get("Why it matters", "")
-        old_curr = section_map.get("Current assessment", "")
-        new_what = parsed_payload.get("new_what_it_is") or old_what
-        new_why = parsed_payload.get("new_why_it_matters") or old_why
-        new_curr = parsed_payload.get("new_current_assessment") or old_curr
-        history_bullets = _extract_history_bullets(entity.body)
-        new_body = render(
-            what_it_is=new_what,
-            why_it_matters=new_why,
-            current_assessment=new_curr,
+        new_body = render_artifact(
+            what_it_is=what_it_is or sections.get("What it is", ""),
+            evaluation_rationale=eval_rationale or sections.get("Evaluation rationale", ""),
             history_bullets=history_bullets,
         )
 
-    # Persist the frontmatter+body changes (if any) before appending a
-    # history bullet — append_history reads the entity off disk and would
-    # otherwise drop our prose update.
-    if status_changed or prose_changed or new_frontmatter != entity.frontmatter:
-        vault.write_entity(Entity(id=entity.id, frontmatter=new_frontmatter, body=new_body))
+        new_fm = dict(fm)
+        new_fm["evaluation"] = new_evaluation
+        new_fm["last_evaluated"] = today
+        if snap:
+            new_fm["stars"] = snap.stars
 
-    # ---- 6. History bullet ----------------------------------------------
-    history_text: str | None = None
-    if status_changed:
-        suffix = f" {rationale}" if rationale else ""
-        history_text = f"Status: {current_status} -> {new_status}.{suffix}".strip()
-    elif prose_changed:
-        suffix = f" {rationale}" if rationale else ""
-        history_text = f"Re-evaluated.{suffix}".strip()
+        updated = Artifact(id=artifact.id, frontmatter=new_fm, body=new_body)
+        vault.write_artifact(updated)
+        result.prose_updated = prose_changed
 
-    if history_text:
-        vault.append_history(entity.id, history_text, entry_date=today)
-
-    # ---- 7. Embedding refresh -------------------------------------------
-    if prose_changed and index is not None:
-        # Re-read so we get the body with the new history bullet stripped
-        # (body_for_embedding skips history anyway, but reading is cheap and
-        # keeps this honest).
-        refreshed = vault.read_entity(entity.id) or Entity(
-            id=entity.id, frontmatter=new_frontmatter, body=new_body
-        )
         try:
-            index.upsert(entity.id, vault.body_for_embedding(refreshed.body))
-        except Exception as exc:
-            # Embedding failure shouldn't roll back the rest of the work,
-            # but is worth surfacing.
-            log.error("%s: embedding upsert failed: %s", entity.id, exc)
-
-    # ---- 8. Record summary state ----------------------------------------
-    if status_changed:
-        result.moved = {"from": current_status, "to": new_status, "rationale": rationale}
-    if prose_changed:
-        result.prose_updated = True
+            artifact_index.upsert(artifact.id, new_body)
+        except Exception as exc:  # noqa: BLE001
+            log.error("embedding upsert failed for %s: %s", artifact.id, exc)
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Batch orchestration.
+# Pass 2: Concept lifecycle re-evaluation
 # ---------------------------------------------------------------------------
 
 
-def _pick_entities(only: str | None) -> list[Entity]:
-    if only:
-        ent = vault.read_entity(only)
-        if ent is None:
-            raise SystemExit(f"--only {only!r}: entity not found")
-        return [ent]
-    # `emerging` + `watch` only. `adopt` requires human action; `skip`/`settled` are done.
-    return vault.list_entities(status="emerging") + vault.list_entities(status="watch")
+def _build_concept_prompt(
+    context_md: str,
+    concept: Concept,
+    artifacts: list[Artifact],
+) -> str:
+    artifact_lines: list[str] = []
+    for art in artifacts:
+        fm = art.frontmatter
+        sections = parse_artifact(art.body)
+        what = sections.get("What it is", "").split("\n")[0][:100]
+        eval_val = fm.get("evaluation", "new")
+        rel = fm.get("relationship", "implements")
+        atype = fm.get("type", "repo")
+        artifact_lines.append(
+            f"- {art.id} ({atype}, {rel}, evaluation={eval_val}): {what}"
+        )
+
+    return (
+        "# Researcher context\n"
+        f"{context_md.strip()}\n\n"
+        "# Concept under review\n"
+        f"## frontmatter\n```json\n{json.dumps(concept.frontmatter, indent=2, default=str)}\n```\n\n"
+        f"## body\n{concept.body.strip()}\n\n"
+        "# Linked artifacts\n"
+        + "\n".join(artifact_lines)
+        + "\n\n"
+        "# Task\n"
+        "Evaluate this concept's lifecycle status based on the quality of its artifacts. "
+        "If status_changed, set new_status and write new_current_assessment. "
+        "Return JSON per the schema."
+    )
 
 
-def _build_router(cfg: config_module.Config) -> Router | None:
-    """Construct a Router only if at least one provider in the enrichment
-    chain is ready. Otherwise return None (offline dev mode)."""
-    router = Router(cfg)
-    if not router.available_providers("enrichment"):
-        log.warning("no LLM providers available for task=enrichment; running without evaluation step")
-        return None
-    return router
+def _enrich_concept(
+    concept: Concept,
+    *,
+    router: Router,
+    context_md: str,
+    concept_index: Index,
+    today: str,
+    dry_run: bool,
+) -> _ConceptResult:
+    result = _ConceptResult(id=concept.id)
+    artifacts = vault.find_artifacts_for_concept(concept.id)
+
+    if not artifacts:
+        log.debug("concept %s has no artifacts, skipping", concept.id)
+        return result
+
+    prompt = _build_concept_prompt(context_md, concept, artifacts)
+    try:
+        completion = router.generate(
+            task="enrichment",
+            prompt=prompt,
+            system=_CONCEPT_SYSTEM,
+            response_schema=_CONCEPT_EVAL_SCHEMA,
+            max_tokens=1024,
+        )
+    except AllProvidersFailed as exc:
+        result.error = f"llm failed: {exc}"
+        return result
+
+    parsed = completion.parsed
+    if not isinstance(parsed, dict):
+        result.error = "llm: non-JSON response"
+        return result
+
+    result.evaluated = True
+    fm = concept.frontmatter
+    new_status = parsed.get("new_status", fm.get("status", "emerging"))
+    status_changed = bool(parsed.get("status_changed", False))
+    prose_changed = bool(parsed.get("prose_changed", False))
+
+    if status_changed:
+        result.moved = {
+            "from": fm.get("status"),
+            "to": new_status,
+            "rationale": parsed.get("rationale", ""),
+        }
+
+    if not dry_run and (status_changed or prose_changed):
+        sections = parse_concept(concept.body)
+        history_bullets = _extract_history_bullets(concept.body)
+
+        new_assessment = (
+            parsed.get("new_current_assessment") or sections.get("Current assessment", "")
+        )
+
+        if status_changed:
+            history_bullets.append(
+                f"{today}: status {fm.get('status')} → {new_status}. "
+                f"{parsed.get('rationale', '')[:120]}"
+            )
+        elif prose_changed:
+            history_bullets.append(f"{today}: Assessment updated.")
+
+        # Rebuild artifact summary table from current vault state
+        artifact_rows = [
+            {
+                "id": a.id,
+                "type": a.frontmatter.get("type", "repo"),
+                "evaluation": a.frontmatter.get("evaluation", "new"),
+            }
+            for a in artifacts
+        ]
+
+        new_body = render_concept(
+            what_it_is=sections.get("What it is", ""),
+            why_it_matters=sections.get("Why it matters", ""),
+            current_assessment=new_assessment,
+            artifact_rows=artifact_rows,
+            history_bullets=history_bullets,
+        )
+
+        new_fm = dict(fm)
+        new_fm["status"] = new_status
+        new_fm["last_evaluated"] = today
+
+        updated = Concept(id=concept.id, frontmatter=new_fm, body=new_body)
+        vault.write_concept(updated)
+        result.prose_updated = prose_changed
+
+        try:
+            concept_index.upsert(concept.id, new_body)
+        except Exception as exc:  # noqa: BLE001
+            log.error("concept embedding upsert failed for %s: %s", concept.id, exc)
+
+    return result
 
 
-def _write_summary(cfg: config_module.Config, today: str, results: list[_EntityResult]) -> None:
-    summary = {
-        "date": today,
-        "evaluated": sum(1 for r in results if r.evaluated),
-        "moved": [
-            {"id": r.id, **r.moved}
-            for r in results
-            if r.moved is not None
+# ---------------------------------------------------------------------------
+# Output + printing
+# ---------------------------------------------------------------------------
+
+_TERMINAL_CONCEPT_STATUSES = {"common", "superseded", "abandoned"}
+
+
+def _print_artifact_result(r: _ArtifactResult, dry_run: bool) -> None:
+    prefix = "[dry-run] " if dry_run else ""
+    if r.error:
+        print(f"{prefix}{r.id}: ERROR {r.error}")
+        return
+    if not r.evaluated:
+        print(f"{prefix}{r.id}: skipped")
+        return
+    parts = [f"{prefix}{r.id}:"]
+    if r.moved:
+        parts.append(f"evaluation {r.moved['from']} → {r.moved['to']}")
+    else:
+        parts.append("evaluation unchanged")
+    if r.prose_updated:
+        parts.append("prose updated")
+    if r.significant_change:
+        d = r.significant_change.get("deltas", {})
+        sd = d.get("stars_delta")
+        parts.append(f"Δstars={sd:+d}" if sd is not None else "")
+    print("  ".join(p for p in parts if p))
+
+
+def _print_concept_result(r: _ConceptResult, dry_run: bool) -> None:
+    prefix = "[dry-run] " if dry_run else ""
+    if r.error:
+        print(f"{prefix}{r.id}: ERROR {r.error}")
+        return
+    if not r.evaluated:
+        return
+    parts = [f"{prefix}concept {r.id}:"]
+    if r.moved:
+        parts.append(f"status {r.moved['from']} → {r.moved['to']}")
+    else:
+        parts.append("status unchanged")
+    print("  ".join(parts))
+
+
+def _write_enrich_output(output: _EnrichOutput, cfg: config_module.Config) -> None:
+    data = {
+        "artifact_evaluations_changed": [
+            {
+                "id": r.id,
+                "from": r.moved["from"],
+                "to": r.moved["to"],
+                "rationale": r.moved.get("rationale", ""),
+            }
+            for r in output.artifact_results
+            if r.moved
         ],
-        "significant_signal_change": [
-            {"id": r.id, **r.significant_change}
-            for r in results
-            if r.significant_change is not None
+        "concept_status_changed": [
+            {
+                "id": r.id,
+                "from": r.moved["from"],
+                "to": r.moved["to"],
+                "rationale": r.moved.get("rationale", ""),
+            }
+            for r in output.concept_results
+            if r.moved
         ],
-        "prose_updated": [r.id for r in results if r.prose_updated],
+        "significant_signal_changes": [
+            {"id": r.id, "deltas": r.significant_change["deltas"]}
+            for r in output.artifact_results
+            if r.significant_change
+        ],
         "errors": [
             {"id": r.id, "error": r.error}
-            for r in results
-            if r.error is not None
+            for r in (output.artifact_results + output.concept_results)  # type: ignore[operator]
+            if r.error
         ],
     }
-    path = cfg.enrich_output_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    log.info("enrich summary written to %s", path)
-
-
-def _print_stdout_summary(results: list[_EntityResult]) -> None:
-    moved = [r for r in results if r.moved is not None]
-    significant = [r for r in results if r.significant_change is not None]
-    errors = [r for r in results if r.error is not None]
-    evaluated = sum(1 for r in results if r.evaluated)
-
-    print(
-        f"Enrich complete: {evaluated} entities evaluated, "
-        f"{len(moved)} moved status, "
-        f"{len(significant)} significant signal changes, "
-        f"{len(errors)} error{'' if len(errors) == 1 else 's'}"
-    )
-    if moved:
-        print("Moved:")
-        # Pad ids for nicer alignment.
-        id_width = max(len(r.id) for r in moved) + 1
-        for r in moved:
-            m = r.moved or {}
-            rationale = m.get("rationale", "")
-            arrow = f"{m.get('from', '?')} -> {m.get('to', '?')}"
-            print(f"  - {r.id:<{id_width}} {arrow}" + (f"  ({rationale})" if rationale else ""))
-    if errors:
-        print("Errors:")
-        for r in errors:
-            print(f"  - {r.id}: {r.error}")
+    out_path = cfg.enrich_output_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    log.info("enrich output written to %s", out_path)
 
 
 # ---------------------------------------------------------------------------
-# CLI.
+# CLI
 # ---------------------------------------------------------------------------
 
 
-def _parse_args(argv: list[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="jobs.enrich",
-        description="Weekly enrich pass: refresh signals, re-evaluate status/prose.",
-    )
-    p.add_argument("--only", help="Run on a single entity id (testing)")
-    p.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Compute snapshots and deltas, call the LLM, but write nothing.",
-    )
-    return p.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
+@app.command()
+def enrich(
+    only: str | None = typer.Option(None, "--only", metavar="ID", help="Single artifact ID."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="No writes, LLM still called."),
+    concepts_only: bool = typer.Option(
+        False, "--concepts-only", help="Skip Pass 1, only run concept re-evaluation."
+    ),
+) -> None:
+    """Weekly enrichment: refresh artifact signals + re-evaluate concepts."""
     cfg = config_module.load()
     setup_logging(level=cfg.log_level, log_file=cfg.log_file)
-
     today = _today_iso()
-    log.info("enrich starting (date=%s dry_run=%s only=%s)", today, args.dry_run, args.only)
 
     try:
         context_md = cfg.context_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        log.warning("context file %s not found; using empty context", cfg.context_path)
         context_md = ""
 
-    entities = _pick_entities(args.only)
-    log.info("processing %d entit%s", len(entities), "y" if len(entities) == 1 else "ies")
+    router = Router(cfg)
+    if not router.available_providers("enrichment"):
+        print("WARNING: no providers available for task=enrichment. LLM calls will fail.")
 
-    router = _build_router(cfg)
+    artifact_index = Index(cfg, layer="artifacts")
+    concept_index = Index(cfg, layer="concepts")
+    output = _EnrichOutput()
 
-    # Only construct the embedding Index when we'll actually use it. Loading
-    # it warms a JSON file; not the end of the world but unnecessary on dry-run.
-    index: Index | None = None
-    if not args.dry_run:
-        try:
-            index = Index(cfg)
-        except Exception as exc:
-            log.error("could not load embedding index (continuing without): %s", exc)
-            index = None
+    # -----------------------------------------------------------------------
+    # Pass 1: Artifacts
+    # -----------------------------------------------------------------------
+    if not concepts_only:
+        if only:
+            artifact = vault.read_artifact(only)
+            if artifact is None:
+                print(f"ERROR: artifact {only!r} not found.", file=sys.stderr)
+                raise typer.Exit(code=1)
+            artifacts_to_enrich = [artifact]
+        else:
+            all_artifacts = vault.list_artifacts()
+            # Skip artifacts whose concept is in a terminal state
+            terminal_concepts: set[str] = set()
+            for concept in vault.list_concepts():
+                if concept.frontmatter.get("status") in _TERMINAL_CONCEPT_STATUSES:
+                    terminal_concepts.add(concept.id)
 
-    results: list[_EntityResult] = []
-    for entity in entities:
-        try:
-            result = _process_entity(
-                entity,
-                cfg=cfg,
-                context_md=context_md,
+            artifacts_to_enrich = []
+            for art in all_artifacts:
+                ev = art.frontmatter.get("evaluation", "new")
+                if ev in ("deprecated",):
+                    continue
+                concept_id = art.frontmatter.get("concept", "")
+                if concept_id in terminal_concepts:
+                    log.debug("skipping %s: concept %s is terminal", art.id, concept_id)
+                    continue
+                artifacts_to_enrich.append(art)
+
+        print(f"\n=== Pass 1: Enriching {len(artifacts_to_enrich)} artifacts ===")
+        for art in artifacts_to_enrich:
+            result = _enrich_artifact(
+                art,
                 router=router,
-                dry_run=args.dry_run,
-                index=index,
+                context_md=context_md,
+                thresholds=cfg.thresholds,
+                artifact_index=artifact_index,
+                today=today,
+                dry_run=dry_run,
             )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:  # noqa: BLE001 - we want to capture everything else
-            log.exception("%s: unhandled exception during enrich", entity.id)
-            result = _EntityResult(id=entity.id, error=f"{type(exc).__name__}: {exc}")
-        results.append(result)
+            output.artifact_results.append(result)
+            _print_artifact_result(result, dry_run)
 
-    if not args.dry_run:
-        _write_summary(cfg, today, results)
+    # -----------------------------------------------------------------------
+    # Pass 2: Concepts
+    # -----------------------------------------------------------------------
+    if not only:
+        active_concepts = [
+            c for c in vault.list_concepts()
+            if c.frontmatter.get("status") not in _TERMINAL_CONCEPT_STATUSES
+        ]
+        print(f"\n=== Pass 2: Re-evaluating {len(active_concepts)} concepts ===")
+        for concept in active_concepts:
+            result = _enrich_concept(
+                concept,
+                router=router,
+                context_md=context_md,
+                concept_index=concept_index,
+                today=today,
+                dry_run=dry_run,
+            )
+            output.concept_results.append(result)
+            _print_concept_result(result, dry_run)
 
-    _print_stdout_summary(results)
-    return 0
+    # -----------------------------------------------------------------------
+    # Summary + output file
+    # -----------------------------------------------------------------------
+    art_moved = sum(1 for r in output.artifact_results if r.moved)
+    art_errors = sum(1 for r in output.artifact_results if r.error)
+    concept_moved = sum(1 for r in output.concept_results if r.moved)
+    concept_errors = sum(1 for r in output.concept_results if r.error)
+
+    print(f"\n=== Summary ===")
+    print(f"Artifacts: {len(output.artifact_results)} processed, {art_moved} evaluation changes, {art_errors} errors")
+    print(f"Concepts:  {len(output.concept_results)} processed, {concept_moved} status changes, {concept_errors} errors")
+
+    if not dry_run and not only:
+        _write_enrich_output(output, cfg)
+
+    if art_errors or concept_errors:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    app()

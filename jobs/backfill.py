@@ -1,16 +1,17 @@
 """Backfill star history for tracked GitHub repos.
 
 Fetches sampled stargazer timestamps from the GitHub API and writes them as
-source="backfill" signal entries. This gives the enrich job historical context
-for repos that were added to the radar long after they first gained traction.
+source="backfill" signal entries against each artifact id. This gives the
+enrich job historical context for repos that were added to the radar long
+after they first gained traction.
 
-The enrich job also auto-backfills on first run per entity; this standalone
+The enrich job also auto-backfills on first run per artifact; this standalone
 script is useful for bulk backfilling your existing vault, or for re-running
 with more samples.
 
 Usage:
-    raidar backfill                  # all entities with github_repo
-    raidar backfill --only ID        # single entity
+    raidar backfill                  # all artifacts with github_repo
+    raidar backfill --only ID        # single artifact
     raidar backfill --dry-run        # show plan without writing
     raidar backfill --samples 20     # denser history (more API calls)
     raidar backfill --force          # re-backfill even if already done
@@ -42,20 +43,20 @@ app = typer.Typer(add_completion=False, help=__doc__)
 _MIN_RATE_DEFAULT = 300
 
 
-def _backfill_entity(
-    entity: vault.Entity,
+def _backfill_artifact(
+    artifact: vault.Artifact,
     *,
     dry_run: bool = False,
     samples: int = 12,
     force: bool = False,
     min_rate: int = _MIN_RATE_DEFAULT,
 ) -> tuple[int, str]:
-    """Backfill one entity. Returns (signals_written, status_msg)."""
-    github_repo = entity.frontmatter.get("github_repo")
+    """Backfill one artifact. Returns (signals_written, status_msg)."""
+    github_repo = artifact.frontmatter.get("github_repo")
     if not github_repo:
         return 0, "skip: no github_repo"
 
-    if not force and vault.has_star_history_backfill(entity.id):
+    if not force and vault.has_star_history_backfill(artifact.id):
         return 0, "skip: already backfilled"
 
     parsed = parse_repo_url(str(github_repo))
@@ -82,7 +83,7 @@ def _backfill_entity(
 
     if not dry_run:
         for star_count, starred_at in history:
-            vault.append_signal(entity.id, {
+            vault.append_signal(artifact.id, {
                 "date": starred_at[:10],
                 "stars": star_count,
                 "source": "backfill",
@@ -95,7 +96,7 @@ def _backfill_entity(
 
 @app.command()
 def backfill(
-    only: str | None = typer.Option(None, "--only", metavar="ID", help="Single entity ID."),
+    only: str | None = typer.Option(None, "--only", metavar="ID", help="Single artifact ID."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Print plan without writing."),
     samples: Annotated[int, typer.Option("--samples", help="Stargazer pages to fetch per repo.")] = 12,
     force: bool = typer.Option(False, "--force", help="Re-backfill even if already done."),
@@ -106,32 +107,32 @@ def backfill(
     setup_logging(level=cfg.log_level, log_file=cfg.log_file)
 
     if only:
-        entity = vault.read_entity(only)
-        if entity is None:
-            print(f"ERROR: entity {only!r} not found.", file=sys.stderr)
+        artifact = vault.read_artifact(only)
+        if artifact is None:
+            print(f"ERROR: artifact {only!r} not found.", file=sys.stderr)
             raise typer.Exit(code=1)
-        entities = [entity]
+        artifacts = [artifact]
     else:
-        entities = vault.list_entities()
+        artifacts = vault.list_artifacts()
 
     done = skipped = errors = 0
-    for entity in entities:
-        n, msg = _backfill_entity(
-            entity, dry_run=dry_run, samples=samples, force=force, min_rate=min_rate,
+    for artifact in artifacts:
+        n, msg = _backfill_artifact(
+            artifact, dry_run=dry_run, samples=samples, force=force, min_rate=min_rate,
         )
         prefix = "[dry-run] " if dry_run else ""
         if msg.startswith("abort"):
-            print(f"{prefix}{entity.id}: {msg}", file=sys.stderr)
+            print(f"{prefix}{artifact.id}: {msg}", file=sys.stderr)
             print(f"\nAborted after {done} backfilled, {skipped} skipped, {errors} errors.")
             raise typer.Exit(code=1)
         elif msg.startswith("error"):
-            print(f"{prefix}{entity.id}: {msg}", file=sys.stderr)
+            print(f"{prefix}{artifact.id}: {msg}", file=sys.stderr)
             errors += 1
         elif msg.startswith("skip"):
-            log.debug("%s: %s", entity.id, msg)
+            log.debug("%s: %s", artifact.id, msg)
             skipped += 1
         else:
-            print(f"{prefix}{entity.id}: {msg}")
+            print(f"{prefix}{artifact.id}: {msg}")
             done += 1
 
     print(f"\nDone: {done} backfilled, {skipped} skipped, {errors} errors.")

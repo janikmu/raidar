@@ -209,8 +209,9 @@ Personal AI tooling intelligence vault. Managed by [raidar](https://github.com/y
 
 | Directory | Contents |
 |-----------|----------|
-| `entities/` | One `.md` file per tracked entity (frontmatter + prose) |
-| `signals/` | Append-only `.jsonl` signal history per entity |
+| `concepts/` | One `.md` file per concept (the intellectual ideas being tracked) |
+| `artifacts/` | One `.md` file per artifact (repos, papers, posts mapped to concepts) |
+| `signals/` | Append-only `.jsonl` signal history per artifact |
 | `digests/` | Weekly digest outputs |
 | `embeddings/` | Local embeddings index — gitignored, regenerate with `raidar enrich` |
 """
@@ -251,7 +252,7 @@ def init_cmd(
     typer.echo(f"  vault   : {vault_path}\n")
 
     # ---- 1. Vault directories ------------------------------------------
-    for subdir in ("entities", "signals", "digests", "embeddings"):
+    for subdir in ("concepts", "artifacts", "signals", "digests", "embeddings"):
         d = vault_path / subdir
         d.mkdir(parents=True, exist_ok=True)
         # Keep empty directories in git with a .gitkeep
