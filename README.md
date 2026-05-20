@@ -182,8 +182,3 @@ Concept and Artifact files are plain markdown. You can edit `## Current assessme
 or flip `status:` / `evaluation:` in the frontmatter, or remove a tag — the tool reads from
 disk on every call, so changes take effect immediately. `signals/` and
 `embeddings/` are tool-owned; don't edit those by hand.
-
-## Out of scope
-
-Email capture, arXiv ingest, social-media scraping, web UI, multi-user. See
-the original spec for rationale.
