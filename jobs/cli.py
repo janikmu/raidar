@@ -48,6 +48,7 @@ from jobs.reevaluate import reevaluate  # noqa: E402
 from jobs.digest import main as _digest_cmd  # noqa: E402
 from jobs.search import app as _search_app  # noqa: E402
 from jobs.seed import seed as _seed_cmd  # noqa: E402
+from jobs.enrich import enrich as _enrich_cmd  # noqa: E402
 
 app.command("capture")(capture)
 app.command("bulk-capture")(bulk)
@@ -55,27 +56,8 @@ app.command("backfill")(backfill)
 app.command("reevaluate")(reevaluate)
 app.command("digest")(_digest_cmd)
 app.command("seed")(_seed_cmd)
+app.command("enrich")(_enrich_cmd)
 app.add_typer(_search_app, name="search")
-
-# ---------------------------------------------------------------------------
-# enrich — argparse wrapper
-# ---------------------------------------------------------------------------
-
-
-@app.command("enrich")
-def enrich_cmd(
-    only: Optional[str] = typer.Option(None, "--only", metavar="ID", help="Single entity ID."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Compute but write nothing."),
-) -> None:
-    """Weekly enrich pass: refresh signals, re-evaluate status and prose."""
-    from jobs.enrich import main as enrich_main
-    args: list[str] = []
-    if only:
-        args += ["--only", only]
-    if dry_run:
-        args.append("--dry-run")
-    sys.exit(enrich_main(args))
-
 
 # ---------------------------------------------------------------------------
 # init
