@@ -13,15 +13,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__UV__</string>
-        <string>run</string>
-        <string>python</string>
-        <string>-m</string>
-        <string>jobs.enrich</string>
+        <string>__PROGRAM_ARGUMENTS__</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>__TOOL_DIR__</string>
+    <string>__WORKING_DIRECTORY__</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -43,8 +39,8 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>__TOOL_DIR__/logs/launchd.enrich.out.log</string>
+    <string>__LOG_DIR__/launchd.enrich.out.log</string>
     <key>StandardErrorPath</key>
-    <string>__TOOL_DIR__/logs/launchd.enrich.err.log</string>
+    <string>__LOG_DIR__/launchd.enrich.err.log</string>
 </dict>
 </plist>

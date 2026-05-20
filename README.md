@@ -6,10 +6,7 @@
 
 Personal AI tooling intelligence system. Captures, enriches, and surfaces
 knowledge about the AI tooling landscape from URLs, notes, and scheduled
-GitHub signal pulls.
-
-This repo is the **tool**. The knowledge vault is a separate private repo
-(default: `~/raidar-vault`), configured in `config.yaml`.
+GitHub signal pulls.This repo is the **tool**. The knowledge vault is a separate private repo (default: `~/raidar-vault`), and the configuration is stored in the standard user config path (e.g. `~/.config/raidar/config.yaml`).
 
 The vault uses a **two-layer knowledge model**:
 1. **Concepts**: Intellectual ideas (e.g., `multi-agent-frameworks`) with a lifecycle status (`emerging`, `watch`, `invest`, `common`, `superseded`, `abandoned`).
@@ -18,9 +15,8 @@ The vault uses a **two-layer knowledge model**:
 ## Architecture in one breath
 
 - **Three jobs**: `capture` (on-demand), `enrich` (Sunday 20:00 via launchd),
-  `digest` (Sunday 21:00 via launchd). Each is `python -m jobs.<name>`.
-- **One CLI for querying**: `python -m jobs.search` with subcommands
-  (`keyword | semantic | concept | artifact | signals | digest | list-concepts | list-artifacts | pending`).
+  `digest` (Sunday 21:00 via launchd). All jobs and query utilities are accessed via a unified global CLI executable.
+- **Unified CLI**: `raidar` with subcommands (`capture`, `enrich`, `digest`, `seed`, `backfill`, `reevaluate`, `search`).
 - **One LLM router** (`lib/llm.py`) routes per-task to a configured chain of
   OpenAI-wire-compatible providers (academic proxy → local LMStudio fallback).
 - **Local embeddings** via LMStudio (any OpenAI-compatible embedding model), flat JSON indexes, numpy cosine.
@@ -28,78 +24,100 @@ The vault uses a **two-layer knowledge model**:
 
 ## Quickstart
 
-### 1. Install dependencies
+### 1. Install the CLI globally
+
+Install the CLI globally in editable mode so any changes in the repository are immediately reflected in the executable:
 
 ```bash
-uv sync
+uv tool install --editable .
 ```
 
-### 2. Configure secrets
+This registers the global `raidar` executable in your `PATH`.
+
+### 2. Initialize the Vault and Config
+
+Run the `init` command to scaffold your vault and active configuration files:
 
 ```bash
-cp .env.example .env
-# Fill in:
-#   ACADEMIC_API_KEY   — your academic OpenAI-compatible proxy key
-#   ACADEMIC_BASE_URL  — proxy base URL (e.g. https://proxy.host/v1)
-#   GITHUB_PAT         — GitHub personal access token (read:public_repo scope)
-#   LMSTUDIO_BASE_URL  — defaults to http://localhost:1234/v1 if unset
+raidar init --vault ~/raidar-vault
 ```
 
-### 3. Start LMStudio
+This does the following automatically:
+- Creates a new knowledge vault at `~/raidar-vault/` with subfolders (`concepts`, `artifacts`, `signals`, `digests`, `embeddings`, `logs`).
+- Creates a `logs/` directory inside your vault to house execution and automated logs.
+- Templates a default `.gitignore` in the vault to automatically ignore `embeddings/` and `logs/`.
+- Templates a default `context.md` directly inside the vault.
+- Scaffolds a custom `config.yaml` at your standard user configuration directory (e.g., `~/.config/raidar/config.yaml` on macOS/Linux).
 
-LMStudio serves both the chat fallback and the embedding model on the same
-OpenAI-compatible endpoint (port 1234), routing by the `model` field in each
-request. Load both models in the LMStudio UI:
+### 3. Configure Secrets
 
-- **Chat model** — e.g. `qwen/qwen3.5-9b` (or any model that fits your RAM
-  budget). Update `providers.local-lmstudio.model` in [config.yaml](config.yaml)
-  to match the id LMStudio shows.
-- **Embedding model** — e.g. `text-embedding-nomic-embed-text-v1.5`. Update
-  `embeddings.model` in [config.yaml](config.yaml) similarly.
+Copy the secrets template to your active configuration folder:
 
-Then start the server (LMStudio UI: Developer → Start Server) so it listens
-on `http://localhost:1234/v1`. Both models stay loaded concurrently — on a
-32 GB M5 with 50% allocation, qwen3.5-9b (~6 GB) + nomic-embed-text (~100 MB)
-fit comfortably.
+```bash
+cp .env.example ~/.config/raidar/.env
+```
 
-### 4. Verify the install
+Open `~/.config/raidar/.env` and fill in:
+- `ACADEMIC_API_KEY` — your academic OpenAI-compatible proxy key
+- `ACADEMIC_BASE_URL` — proxy base URL (e.g. `https://proxy.host/v1`)
+- `GITHUB_PAT` — GitHub personal access token (with `read:public_repo` scope)
+- `LMSTUDIO_BASE_URL` — defaults to `http://localhost:1234/v1` if unset
+
+*(Note: You can also place a local `.env` file in the current working directory to temporarily override secrets for local development).*
+
+### 4. Start LMStudio
+
+LMStudio serves both the chat fallback and the embedding model on the same OpenAI-compatible endpoint (port 1234), routing by the `model` field in each request. Load both models in the LMStudio UI:
+
+- **Chat model** — e.g. `qwen/qwen3.5-9b` (or any model that fits your RAM budget). Update `providers.local-lmstudio.model` in your active `config.yaml` to match the model ID LMStudio shows.
+- **Embedding model** — e.g. `text-embedding-nomic-embed-text-v1.5`. Update `embeddings.model` in your active `config.yaml` similarly.
+
+Then start the server (LMStudio UI: Developer → Start Server) so it listens on `http://localhost:1234/v1`. Both models stay loaded concurrently — on a 32 GB M5 with 50% allocation, qwen3.5-9b (~6 GB) + nomic-embed-text (~100 MB) fit comfortably.
+
+### 5. Verify the install
+
+Run the offline smoke test to check system wiring:
 
 ```bash
 bash infra/smoke.sh
 ```
 
-You want to see "0 fail". Skips are fine if LMStudio isn't running yet — re-run
-once the server is up with both models loaded to exercise the full path.
+You want to see all checks pass (skips are fine if LMStudio isn't running yet — re-run once the server is up with both models loaded to exercise the full path).
 
-### 5. Capture your first artifact
+### 6. Capture your first artifact
+
+Use the global `raidar` command directly:
 
 ```bash
-uv run python -m jobs.capture https://github.com/some-org/some-tool
-uv run python -m jobs.search concept <concept-id-the-capture-printed>
-uv run python -m jobs.search artifact <artifact-id-the-capture-printed>
+raidar capture https://github.com/astral-sh/uv
+raidar search concept <concept-id-the-capture-printed>
+raidar search artifact <artifact-id-the-capture-printed>
 ```
 
-### 6. Install scheduled jobs
+### 7. Install scheduled jobs (macOS only)
+
+Ensure automated background processing runs weekly:
 
 ```bash
 ./infra/install_launchd.sh
 launchctl list | grep airadar     # both com.airadar.enrich and com.airadar.digest should appear
 ```
 
-Next enrich fires Sunday 20:00 local time; digest at 21:00. To uninstall:
-`./infra/install_launchd.sh uninstall`.
+This setup script:
+- Safely checks that you are running on macOS (`Darwin`).
+- Dynamically templates the `launchd` plist jobs to use the global `raidar` binary from your `PATH` (falling back to repository `uv run` if not globally installed).
+- Directs `stdout` and `stderr` logs straight to your vault's `logs/` directory (e.g. `~/raidar-vault/logs/launchd.enrich.out.log`) so they are easy to monitor.
 
-### 7. Connect Cowork
+To uninstall background jobs: `./infra/install_launchd.sh uninstall`.
 
-Open this directory as a Claude Cowork project with filesystem access and shell
-execution enabled. Cowork reads [SKILL.md](SKILL.md) automatically and learns
-the CLI surface. Then paste a URL into chat — Claude will run `capture` and
-report back.
+### 8. Connect Cowork
+
+Open this directory as a Claude Cowork project with filesystem access and shell execution enabled. Cowork reads [SKILL.md](SKILL.md) automatically and learns the CLI surface. Then paste a URL into chat — Claude will run `capture` and report back.
 
 ## Layout
 
 ```
-ai-radar-tool/                    (this repo)
+ai-radar-tool/                    (this repo - stateless utility)
   jobs/
     capture.py                    on-demand capture (URL or text -> artifact + concept)
     bulk_capture.py               bulk capture from awesome-lists and newsletter pages
@@ -116,17 +134,19 @@ ai-radar-tool/                    (this repo)
     embeddings.py                 Ollama embeddings + split numpy indexes
     github.py                     GitHub API client (httpx + tenacity)
     body.py                       canonical body renderer/parser for concepts and artifacts
-    config.py                     config.yaml loader
+    config.py                     config.yaml loader / active config resolver
     secrets.py                    .env / env-var access
     logging_setup.py              logging configured once per process
   infra/
     launchd/com.airadar.{enrich,digest}.plist   templates (placeholders substituted on install)
-    install_launchd.sh            install / uninstall
+    install_launchd.sh            install / uninstall with OS safeguards & PATH detection
     smoke.sh                      offline acceptance test
-  config.yaml                     paths, provider configs, task chains, thresholds
-  context.md                      personal relevance anchor (edit freely)
+    test_sandbox.sh               sandboxed isolated integration test
   SKILL.md                        Cowork integration instructions
-  .env                            local secrets (gitignored)
+
+~/.config/raidar/                 (standard user configuration directory)
+  config.yaml                     active paths, provider configs, task chains, thresholds
+  .env                            global secrets / API keys (gitignored, loaded by CLI)
 
 ai-radar-vault/                   (separate private repo at ~/raidar-vault)
   concepts/<id>.md                YAML frontmatter + markdown body
@@ -135,6 +155,8 @@ ai-radar-vault/                   (separate private repo at ~/raidar-vault)
   digests/YYYY-MM-DD.md           weekly digests
   embeddings/concepts.json        embedding index for concepts
   embeddings/artifacts.json       embedding index for artifacts
+  logs/                           tool and launchd execution logs
+  context.md                      personal relevance anchor (edit freely, tracked in vault git)
 ```
 
 ## How the LLM router routes

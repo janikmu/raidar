@@ -11,7 +11,23 @@ import yaml
 
 from lib import secrets
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+def get_config_path() -> Path:
+    import os
+    # 1. Environment variable override
+    if "RAIDAR_CONFIG" in os.environ:
+        return Path(os.environ["RAIDAR_CONFIG"]).expanduser().resolve()
+    
+    # 2. Check ~/.config/raidar/config.yaml first (standard developer shortcut)
+    dev_path = Path.home() / ".config" / "raidar" / "config.yaml"
+    if dev_path.exists():
+        return dev_path
+    
+    # 3. Standard platform-specific configuration path
+    from platformdirs import user_config_dir
+    return Path(user_config_dir("raidar", appauthor=False)) / "config.yaml"
+
+
+CONFIG_PATH = get_config_path()
 
 
 @dataclass(frozen=True)
@@ -74,8 +90,16 @@ def _resolve_provider(name: str, raw: dict[str, Any]) -> ProviderConfig:
 
 @lru_cache(maxsize=1)
 def load() -> Config:
-    with CONFIG_PATH.open() as fp:
-        raw = yaml.safe_load(fp)
+    # Refresh in case get_config_path changes dynamically (e.g. in tests)
+    config_path = get_config_path()
+    try:
+        with config_path.open() as fp:
+            raw = yaml.safe_load(fp)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Configuration file not found at {config_path}.\n"
+            f"Please run 'raidar init' first to initialize your configuration and vault."
+        )
 
     vault_path = Path(raw["vault"]["path"]).expanduser()
 
@@ -91,11 +115,24 @@ def load() -> Config:
     log_raw = raw.get("logging", {})
     paths_raw = raw.get("paths", {})
 
-    root = CONFIG_PATH.parent
+    # Resolve relative paths relative to vault_path rather than config file directory
     log_file = log_raw.get("file")
-    log_file_path = (root / log_file).resolve() if log_file else None
-    context_path = (root / paths_raw.get("context", "context.md")).resolve()
-    enrich_output_path = (root / paths_raw.get("enrich_output", "logs/last_enrich.json")).resolve()
+    if log_file:
+        log_file_path = Path(log_file).expanduser()
+        if not log_file_path.is_absolute():
+            log_file_path = (vault_path / log_file_path).resolve()
+    else:
+        log_file_path = None
+
+    context_val = paths_raw.get("context", "context.md")
+    context_path = Path(context_val).expanduser()
+    if not context_path.is_absolute():
+        context_path = (vault_path / context_path).resolve()
+
+    enrich_val = paths_raw.get("enrich_output", "logs/last_enrich.json")
+    enrich_output_path = Path(enrich_val).expanduser()
+    if not enrich_output_path.is_absolute():
+        enrich_output_path = (vault_path / enrich_output_path).resolve()
 
     return Config(
         raw=raw,

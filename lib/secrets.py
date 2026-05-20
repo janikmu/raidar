@@ -28,11 +28,30 @@ def _ensure_loaded() -> None:
 
 
 def _find_dotenv() -> Path | None:
+    # 1. Check current working directory and its parents (very handy for development/local overrides)
+    cwd = Path.cwd()
+    for parent in [cwd, *cwd.parents]:
+        candidate = parent / ".env"
+        if candidate.is_file():
+            return candidate
+
+    # 2. Check the config.yaml directory (for global configurations)
+    try:
+        from lib import config as lib_config
+        config_dir = lib_config.get_config_path().parent
+        candidate = config_dir / ".env"
+        if candidate.is_file():
+            return candidate
+    except Exception:
+        pass
+
+    # 3. Fallback: package code directory and parents (legacy fallback)
     here = Path(__file__).resolve().parent
     for parent in [here, *here.parents]:
         candidate = parent / ".env"
         if candidate.is_file():
             return candidate
+
     return None
 
 

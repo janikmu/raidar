@@ -180,6 +180,9 @@ paths:
 _VAULT_GITIGNORE = """\
 # Embeddings index is large and fully regeneratable — don't commit it.
 embeddings/
+
+# Run-state and execution logs — don't commit them.
+logs/
 """
 
 _VAULT_README = """\
@@ -226,15 +229,16 @@ def init_cmd(
     ),
 ) -> None:
     """Create the vault directory structure and scaffold the project config."""
-    project_dir = Path.cwd()
+    from lib import config as lib_config
+    config_path = lib_config.get_config_path()
     vault_path = Path(vault).expanduser().resolve() if vault else Path("~/raidar-vault").expanduser()
 
     typer.echo(f"\nInitialising raidar")
-    typer.echo(f"  project : {project_dir}")
+    typer.echo(f"  config  : {config_path}")
     typer.echo(f"  vault   : {vault_path}\n")
 
     # ---- 1. Vault directories ------------------------------------------
-    for subdir in ("concepts", "artifacts", "signals", "digests", "embeddings"):
+    for subdir in ("concepts", "artifacts", "signals", "digests", "embeddings", "logs"):
         d = vault_path / subdir
         d.mkdir(parents=True, exist_ok=True)
         # Keep empty directories in git with a .gitkeep
@@ -274,18 +278,25 @@ def init_cmd(
         typer.echo(f"  · vault is already a git repo — skipped")
 
     # ---- 5. context.md -------------------------------------------------
-    context_path = project_dir / "context.md"
+    context_path = vault_path / "context.md"
     if not context_path.exists():
-        context_path.write_text(_CONTEXT_MD_TEMPLATE)
-        typer.echo(f"  {_check_mark(True)} context.md created — edit this to anchor the LLM")
+        # Check if context.md exists in current working directory to copy it (migration safeguard)
+        local_context = Path.cwd() / "context.md"
+        if local_context.is_file():
+            import shutil
+            shutil.copy(local_context, context_path)
+            typer.echo(f"  {_check_mark(True)} context.md copied from current directory to vault")
+        else:
+            context_path.write_text(_CONTEXT_MD_TEMPLATE)
+            typer.echo(f"  {_check_mark(True)} context.md created in vault — edit this to anchor the LLM")
     else:
-        typer.echo(f"  · context.md already exists — skipped")
+        typer.echo(f"  · context.md already exists in vault — skipped")
 
     # ---- 6. config.yaml ------------------------------------------------
-    config_path = project_dir / "config.yaml"
     if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(_CONFIG_YAML_TEMPLATE.format(vault_path=str(vault_path)))
-        typer.echo(f"  {_check_mark(True)} config.yaml created")
+        typer.echo(f"  {_check_mark(True)} config.yaml created at {config_path}")
     else:
         # Check if the vault path in config matches what was requested
         try:
@@ -299,12 +310,20 @@ def init_cmd(
                     f"— update it to {vault_path} if needed"
                 )
             else:
-                typer.echo(f"  · config.yaml already exists and vault path matches — skipped")
+                typer.echo(f"  · config.yaml already exists at {config_path} and vault path matches — skipped")
         except Exception:
-            typer.echo(f"  · config.yaml already exists — skipped")
+            typer.echo(f"  · config.yaml already exists at {config_path} — skipped")
 
     # ---- 7. .env check -------------------------------------------------
-    env_path = project_dir / ".env"
+    env_path = config_path.parent / ".env"
+    
+    # Migration safeguard: copy local .env to global configuration folder if it exists
+    local_env_path = Path.cwd() / ".env"
+    if not env_path.exists() and local_env_path.is_file():
+        import shutil
+        shutil.copy(local_env_path, env_path)
+        typer.echo(f"  {_check_mark(True)} .env copied from current directory to configuration folder")
+
     env_vars: dict[str, str] = {}
     if env_path.exists():
         # Parse without importing dotenv (avoid dependency at init time)
