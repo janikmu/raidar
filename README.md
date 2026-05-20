@@ -1,3 +1,7 @@
+<div align="center">
+  <img width="600" height="198" alt="Gemini_Generated_Image_ad00odad00odad00" src="https://github.com/user-attachments/assets/4efa0537-770a-4c79-9e6d-26037fe7b848" />
+</div>
+  
 # AI Radar — Tool Repo
 
 Personal AI tooling intelligence system. Captures, enriches, and surfaces
