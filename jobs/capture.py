@@ -370,6 +370,7 @@ def _capture_one(
     *,
     force: bool = False,
     today: str | None = None,
+    backfill: bool = False,
 ) -> str:
     """Capture a single input. Returns the artifact_id."""
     today = today or date.today().isoformat()
@@ -584,6 +585,19 @@ def _capture_one(
             f"commits_30d={snapshot.commits_30d} open_issues={snapshot.open_issues}"
         )
 
+    # ----- 13. automatic backfill -----------------------------------------
+    if backfill and source == "github":
+        from jobs.backfill import _backfill_artifact
+        try:
+            print("Backfilling star history…")
+            n, msg = _backfill_artifact(artifact, force=force)
+            if msg.startswith("error") or msg.startswith("abort"):
+                print(f"  Backfill warning: {msg}", file=sys.stderr)
+            elif not msg.startswith("skip"):
+                print(f"  Backfill: {msg}")
+        except Exception as exc:
+            log.warning("failed to automatically backfill %s: %s", artifact_id, exc)
+
     return artifact_id
 
 
@@ -599,6 +613,11 @@ def capture(
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help="Assemble the prompt but don't call the LLM or write to the vault.",
+    ),
+    backfill: bool = typer.Option(
+        True,
+        "--backfill/--no-backfill",
+        help="Automatically backfill star history for captured GitHub repos.",
     ),
 ) -> None:
     """Capture an artifact from a URL or free-text note."""
@@ -635,7 +654,7 @@ def capture(
         return
 
     try:
-        _capture_one(input, cfg, force=force, today=today)
+        _capture_one(input, cfg, force=force, today=today, backfill=backfill)
     except CaptureSkipped as exc:
         if exc.existing_id:
             print(f"Already tracked as {exc.existing_id}")

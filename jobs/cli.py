@@ -3,7 +3,7 @@
 Usage:
     raidar init               [--vault PATH] [--seed]
     raidar seed               [--id ID]... [--list] [--dry-run] [--force]
-    raidar capture <url>      [--force] [--update ID] [--dry-run]
+    raidar capture <url>      [--force] [--update ID] [--dry-run] [--no-backfill]
     raidar bulk-capture <url> [--dry-run] [--limit N] [--force]
     raidar enrich             [--only ID] [--dry-run]
     raidar backfill           [--only ID] [--dry-run] [--samples N] [--force]
