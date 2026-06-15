@@ -201,6 +201,10 @@ class Index:
     def get(self, entity_id: str) -> IndexEntry | None:
         return self._entries.get(entity_id)
 
+    def ids(self) -> list[str]:
+        """Return all entity ids currently in the index."""
+        return list(self._entries.keys())
+
     def upsert(self, entity_id: str, text: str) -> bool:
         """Generate + store an embedding if the prose changed.
 

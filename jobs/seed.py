@@ -35,6 +35,7 @@ import yaml
 from lib import config as config_module
 from lib import vault
 from lib.body import render_concept
+from lib.embeddings import Index
 from lib.llm import AllProvidersFailed, Router
 from lib.logging_setup import setup as setup_logging
 from lib.vault import Concept
@@ -236,9 +237,16 @@ def seed(
         print("ERROR: no LLM providers available for task=enrichment.")
         raise typer.Exit(code=1)
 
+    # Concept embedding index — so seeded anchors are visible to the capture
+    # dedup gate and `raidar health --semantic`. Embedding may be unavailable
+    # (LMStudio offline) at seed time; that's non-fatal — `raidar reindex` fills
+    # the gap later.
+    concept_index = Index(cfg, layer="concepts")
+
     print("")
     n_written = 0
     n_declined = 0
+    n_embedded = 0
     for i, entry in enumerate(to_seed, 1):
         concept = _seed_one(entry, router, today)
         if concept is None:
@@ -247,9 +255,14 @@ def seed(
             continue
         vault.write_concept(concept)
         n_written += 1
+        try:
+            if concept_index.upsert(concept.id, concept.body):
+                n_embedded += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("seed %s: embedding failed (%s); run `raidar reindex` later", concept.id, exc)
         print(f"  [{i}/{len(to_seed)}] {entry['id']:<35}  status={concept.frontmatter['status']}")
 
-    print(f"\nSeed complete: {n_written} written, {n_declined} declined / failed.")
+    print(f"\nSeed complete: {n_written} written ({n_embedded} embedded), {n_declined} declined / failed.")
 
 
 if __name__ == "__main__":

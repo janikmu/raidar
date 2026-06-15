@@ -9,6 +9,10 @@ Usage:
     raidar backfill           [--only ID] [--dry-run] [--samples N] [--force]
     raidar reevaluate         [--only ID] [--status S] [--dry-run]
     raidar digest             [--date YYYY-MM-DD] [--dry-run]
+    raidar health             [--semantic] [--json] [--strict] [--threshold N]
+    raidar merge-concept <source> <target>  [--dry-run]
+    raidar rename-concept <old> <new>       [--label TEXT] [--dry-run]
+    raidar reindex            [--layer concepts|artifacts|all] [--prune] [--dry-run]
     raidar search keyword <query>
     raidar search semantic <query>  [--top-k N]
     raidar search entity <id>
@@ -49,6 +53,10 @@ from jobs.digest import main as _digest_cmd  # noqa: E402
 from jobs.search import app as _search_app  # noqa: E402
 from jobs.seed import seed as _seed_cmd  # noqa: E402
 from jobs.enrich import enrich as _enrich_cmd  # noqa: E402
+from jobs.health import health as _health_cmd  # noqa: E402
+from jobs.merge import merge_concept as _merge_cmd  # noqa: E402
+from jobs.rename import rename_concept as _rename_cmd  # noqa: E402
+from jobs.reindex import reindex as _reindex_cmd  # noqa: E402
 
 app.command("capture")(capture)
 app.command("bulk-capture")(bulk)
@@ -57,6 +65,10 @@ app.command("reevaluate")(reevaluate)
 app.command("digest")(_digest_cmd)
 app.command("seed")(_seed_cmd)
 app.command("enrich")(_enrich_cmd)
+app.command("health")(_health_cmd)
+app.command("merge-concept")(_merge_cmd)
+app.command("rename-concept")(_rename_cmd)
+app.command("reindex")(_reindex_cmd)
 app.add_typer(_search_app, name="search")
 
 # ---------------------------------------------------------------------------
@@ -161,7 +173,13 @@ thresholds:
     abs_star_delta: 50
     rel_star_delta_pct: 20
     rel_commits_30d_pct: 50
+  # Soft artifact dedup: capture warns/skips if a new artifact is this close to one already tracked.
   semantic_dedup: 0.92
+  # Concept dedup gate: a proposed NEW concept this close to an existing one is
+  # attached to the existing concept (flagged review_needed) instead of forked.
+  # Tuned high because the local embedding model compresses agent-tooling concepts
+  # (distinct ideas sit ~0.90; true duplicates ~0.92+). Lower it cautiously.
+  concept_dedup: 0.93
 
 retry:
   max_attempts: 4

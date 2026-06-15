@@ -69,6 +69,16 @@ raidar digest --dry-run               # preview today's digest without writing
 ```
 The full `enrich` and `digest` runs happen automatically via launchd on Sundays (20:00 and 21:00). Do not invoke them without `--dry-run` from a chat session unless the user explicitly asks for a manual run.
 
+### Vault hygiene
+```bash
+raidar health                         # structural check: dangling refs, forked/dup concepts, drift
+raidar health --semantic              # + near-duplicate concept pairs (needs embedding backend)
+raidar reindex --prune                # embed everything on disk; drop orphan + legacy index entries
+raidar merge-concept <src> <dst>      # fold duplicate concept <src> into keeper <dst> (--dry-run first)
+raidar rename-concept <old> <new>     # rename a concept's slug (e.g. agent-skills-library -> agent-skills)
+```
+A concept is a *capability several artifacts could implement as alternatives* — not one product, not a broad umbrella (see `docs/concept-model.md`). Run `raidar health` after bulk captures; it exits non-zero on `error` findings. When it reports a `suffix-dup` or `near-dup-concept`, the suggested `merge-concept` line is the fix — preview with `--dry-run`, then run it. Do not hand-edit concept files to merge them.
+
 ## Output Conventions & Troubleshooting
 
 Every command writes plain text or markdown to stdout. Errors go to stderr with non-zero exit codes:
