@@ -79,7 +79,12 @@ check "backfill --help" uv run python -m jobs.backfill --help
 check "reevaluate --help" uv run python -m jobs.reevaluate --help
 check "seed --help"    uv run python -m jobs.seed --help
 check "seed --list (no LLM)" uv run python -m jobs.seed --list
+check "health --help"  uv run python -m jobs.health --help
+check "merge-concept --help" uv run python -m jobs.merge --help
+check "rename-concept --help" uv run python -m jobs.rename --help
+check "reindex --help" uv run python -m jobs.reindex --help
 check "search list-concepts against empty vault" uv run python -m jobs.search list-concepts
+check "health against empty vault" uv run python -m jobs.health
 
 echo "[capture dry-run]"
 check "capture --dry-run on free text" \

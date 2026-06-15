@@ -156,6 +156,19 @@ def concept_exists(concept_id: str) -> bool:
     return _concept_path(concept_id).is_file()
 
 
+def delete_concept(concept_id: str) -> bool:
+    """Delete concepts/{id}.md. Returns True if a file was removed, False if absent.
+
+    Does not touch the embedding index — callers that maintain embeddings must
+    delete the index entry separately (see lib.embeddings.Index.delete).
+    """
+    path = _concept_path(concept_id)
+    if not path.is_file():
+        return False
+    path.unlink()
+    return True
+
+
 def list_concepts(status: str | None = None) -> list["Concept"]:
     """Return concepts sorted by id, optionally filtered by lifecycle status."""
     concepts_dir = _concepts_dir()

@@ -12,11 +12,13 @@ The vault uses a **two-layer knowledge model**:
 1. **Concepts**: Intellectual ideas (e.g., `multi-agent-frameworks`) with a lifecycle status (`emerging`, `watch`, `invest`, `common`, `superseded`, `abandoned`).
 2. **Artifacts**: Evidence pieces (GitHub repos, papers, blog posts) mapped to a concept, with an evaluation status (`new`, `promising`, `recommended`, `deprecated`, `hype`).
 
+A concept is a *capability several artifacts could implement as alternatives* — not a single product and not a broad umbrella. The rules that keep this consistent, and the three guards that stop duplicate concepts from accreting, are in [docs/concept-model.md](docs/concept-model.md). Run `raidar health` to check the vault against them.
+
 ## Architecture in one breath
 
 - **Three jobs**: `capture` (on-demand), `enrich` (Sunday 20:00 via launchd),
   `digest` (Sunday 21:00 via launchd). All jobs and query utilities are accessed via a unified global CLI executable.
-- **Unified CLI**: `raidar` with subcommands (`capture`, `enrich`, `digest`, `seed`, `backfill`, `reevaluate`, `search`).
+- **Unified CLI**: `raidar` with subcommands (`capture`, `enrich`, `digest`, `seed`, `backfill`, `reevaluate`, `search`, plus vault-hygiene commands `health`, `merge-concept`, `reindex`).
 - **One LLM router** (`lib/llm.py`) routes per-task to a configured chain of
   OpenAI-wire-compatible providers (academic proxy → local LMStudio fallback).
 - **Local embeddings** via LMStudio (any OpenAI-compatible embedding model), flat JSON indexes, numpy cosine.
@@ -126,6 +128,9 @@ ai-radar-tool/                    (this repo - stateless utility)
     backfill.py                   bulk star-history backfill for artifacts
     reevaluate.py                 force re-evaluation of artifacts with full signal history
     seed.py                       seed canonical concepts from training-data knowledge
+    health.py                     vault health checks (dangling refs, dup/forked concepts, drift)
+    merge.py                      merge a duplicate concept into another (remediation)
+    reindex.py                    rebuild embedding indexes from disk; prune orphans/legacy files
     search.py                     CLI: query concepts, artifacts, signals, digests
     cli.py                        unified `raidar` entry point
   lib/
@@ -175,6 +180,27 @@ per-provider (exponential backoff via tenacity), terminal failures fall
 through to the next provider. Running out of providers raises
 `AllProvidersFailed`. Adding a new backend means adding one entry under
 `providers:` and listing it in the relevant `tasks:` chains — no code changes.
+
+## Keeping the vault healthy
+
+The capture step maps each artifact to a concept with one LLM call, which can
+drift into near-duplicate or forked concepts over time. Three things keep it in
+check (full doctrine in [docs/concept-model.md](docs/concept-model.md)):
+
+```bash
+raidar health                     # structural checks: dangling refs, -N forks,
+                                  # duplicate labels, index drift, legacy cruft
+raidar health --semantic          # + embedding-based near-duplicate concept pairs
+raidar reindex --prune            # embed everything on disk; drop orphan + legacy index files
+raidar merge-concept SRC DST      # fold duplicate concept SRC into keeper DST (--dry-run to preview)
+raidar rename-concept OLD NEW     # rename a concept slug (repoints artifacts + embedding)
+```
+
+`raidar health` exits non-zero when it finds an `error` (broken/forked data), so
+it's safe to run in cron or before committing the vault. Capture itself now
+retrieves the nearest existing concepts before classifying and redirects a
+proposed new concept to an existing one when they're within
+`thresholds.concept_dedup` (default 0.93), flagging it `review_needed`.
 
 ## Editing the vault by hand
 

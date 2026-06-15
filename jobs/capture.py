@@ -109,17 +109,31 @@ _SYSTEM_PROMPT = (
     "evaluation_rationale: 2-3 sentences explaining the evaluation, citing concrete evidence.\n"
     "\n"
     "CONCEPT MAPPING:\n"
+    "A concept is a CAPABILITY or APPROACH category that several artifacts could implement as "
+    "alternatives to one another — e.g. 'agent memory', 'LLM routing', 'prompt optimization'. "
+    "It is NOT a single product (never name a concept after one repo) and NOT a broad umbrella "
+    "('agent tooling', 'productivity tools'). A healthy concept could plausibly hold 3+ sibling "
+    "artifacts that compete or substitute for each other.\n"
+    "Strongly PREFER attaching to an existing concept — especially one of the 'Closest existing "
+    "concepts' listed above. Create a new concept ONLY when the artifact's core capability has no "
+    "home AND you can name that capability as a category other tools would also fit.\n"
+    "Do NOT coin near-synonyms of an existing concept: if 'agent-memory' exists, never create "
+    "'agent-memory-systems'; if a token/context-compression concept exists, route every compressor "
+    "there rather than minting a parallel one.\n"
     "concept_id: id of the best matching existing concept, OR a new 2-4 word kebab-case slug.\n"
     "concept_label: human-readable 2-4 word label.\n"
-    "is_new_concept: true only if no existing concept is a good fit AND you can name it "
-    "clearly in 2-4 words. If ambiguous, use the closest existing concept and set "
-    "review_needed=true.\n"
+    "is_new_concept: true ONLY if no existing concept fits. When torn between an existing concept "
+    "and a new one, choose the EXISTING concept and set review_needed=true.\n"
     "concept_what_it_is / concept_why_it_matters: required only when is_new_concept=true.\n"
     "relationship: how this artifact relates to its concept. "
     "DEFAULT 'implements' — builds, embodies, or instantiates the concept (use for the vast majority of repos, "
     "including the most prominent or anchor artifact of a concept). "
     "'extends' — considerably advances the concept beyond its original form (rare). "
-    "'applies' — uses the concept incidentally. "
+    "'applies' — the artifact's primary purpose is something ELSE and it merely uses this concept as a "
+    "component. Meaningful ONLY for technique/construct concepts (e.g. a coding agent that uses retrieval "
+    "internally 'applies' retrieval-augmented-generation — it is not a RAG tool). For concepts that are a "
+    "category of tools (a paradigm — agent-skills, agent-memory), every member 'implements'; never 'applies'. "
+    "Litmus: can an artifact use this concept while being primarily about something else? If no, use 'implements'. "
     "'discusses' — paper/post that comments on the concept without building it. "
     "'introduces' — RESERVED: set ONLY when the artifact is the official tracking repo for a named "
     "spec/protocol/standard that defines this concept, OR the official companion code repo of a "
@@ -196,6 +210,58 @@ def _concept_context() -> str:
     return "\n".join(lines)
 
 
+def _candidate_query(
+    *,
+    source: str,
+    snapshot: RepoSnapshot | None,
+    readme: str | None,
+    web_text: str | None,
+    raw_input: str,
+) -> str:
+    """Short text describing the artifact, used to retrieve nearest concepts."""
+    if source == "github" and snapshot is not None:
+        parts = [f"{snapshot.owner}/{snapshot.name}", snapshot.description or ""]
+        if readme:
+            parts.append(readme[:1500])
+        return "\n".join(p for p in parts if p)
+    if source == "web" and web_text is not None:
+        return web_text[:1500]
+    return raw_input.strip()[:1500]
+
+
+def _candidate_block(query: str, concept_index: Index, k: int = 8) -> str:
+    """Return an enriched block of the K concepts nearest to `query`.
+
+    Each line carries the concept's id, label, status, artifact count and the
+    first line of its 'What it is' so the LLM can recognise a match. Returns
+    "(unavailable)" if the embedding backend is unreachable.
+    """
+    from lib.body import parse as parse_body
+
+    try:
+        hits = concept_index.search(query, top_k=k)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("candidate concept retrieval failed (%s); using flat list only", exc)
+        return "(unavailable — embedding backend offline; rely on the full list below)"
+    if not hits:
+        return "(none)"
+    lines: list[str] = []
+    for cid, score in hits:
+        c = vault.read_concept(cid)
+        if c is None:
+            continue
+        label = c.frontmatter.get("label", cid)
+        status = c.frontmatter.get("status", "?")
+        n = len(c.frontmatter.get("artifacts") or [])
+        what = ""
+        for line in parse_body(c.body).get("What it is", "").splitlines():
+            if line.strip():
+                what = line.strip()
+                break
+        lines.append(f"- {cid} (sim={score:.2f}) | {label} | status={status} | {n} artifact(s)\n    {what}")
+    return "\n".join(lines) if lines else "(none)"
+
+
 # ---------------------------------------------------------------------------
 # Prompt assembly
 # ---------------------------------------------------------------------------
@@ -210,10 +276,17 @@ def _assemble_prompt(
     readme: str | None,
     web_text: str | None,
     concept_context: str,
+    candidate_block: str | None = None,
 ) -> str:
     parts: list[str] = []
     parts.append("## My context\n" + context_md.strip())
-    parts.append("## Existing concepts in vault\n" + concept_context)
+    if candidate_block:
+        parts.append(
+            "## Closest existing concepts (consider these first)\n"
+            "These are the concepts most semantically similar to this artifact. "
+            "Map to one of them unless none is a real fit.\n" + candidate_block
+        )
+    parts.append("## All existing concepts in vault\n" + concept_context)
 
     if source == "github" and snapshot is not None:
         parts.append("## Repo snapshot\n" + _summarize_snapshot(snapshot))
@@ -249,15 +322,32 @@ def _unique_artifact_id(proposed: str) -> str:
         n += 1
 
 
-def _unique_concept_id(proposed: str) -> str:
-    if not vault.concept_exists(proposed):
-        return proposed
-    n = 2
-    while True:
-        candidate = f"{proposed}-{n}"
-        if not vault.concept_exists(candidate):
-            return candidate
-        n += 1
+# Note: there is deliberately no `_unique_concept_id`. A concept slug IS the
+# identity of an idea — if the LLM proposes a "new" concept whose slug already
+# exists, that means it re-derived an existing concept, so we attach to it rather
+# than fork a `-2`. (Artifacts differ: two distinct repos may legitimately want
+# the same slug, hence `_unique_artifact_id` above.)
+
+
+# ---------------------------------------------------------------------------
+# Concept dedup gate
+# ---------------------------------------------------------------------------
+
+
+def _nearest_concept(
+    concept_index: Index, label: str, what_it_is: str, why_it_matters: str
+) -> tuple[str, float] | None:
+    """Return (concept_id, score) of the existing concept nearest to a proposed
+    new one, or None if the index is empty / the backend is unreachable."""
+    query = "\n".join(s for s in (label, what_it_is, why_it_matters) if s)
+    if not query.strip():
+        return None
+    try:
+        hits = concept_index.search(query, top_k=1)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("concept dedup search failed (%s); skipping gate", exc)
+        return None
+    return hits[0] if hits else None
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +508,15 @@ def _capture_one(
 
     concept_ctx = _concept_context()
 
+    # Retrieve the concepts most similar to this artifact and surface them to the
+    # LLM, so it recognises an existing home instead of coining a near-duplicate.
+    concept_index = Index(cfg, layer="concepts")
+    candidate_query = _candidate_query(
+        source=source, snapshot=snapshot, readme=readme,
+        web_text=web_text, raw_input=input_str,
+    )
+    candidate_block = _candidate_block(candidate_query, concept_index)
+
     prompt = _assemble_prompt(
         context_md=context_md,
         source=source,
@@ -426,6 +525,7 @@ def _capture_one(
         readme=readme,
         web_text=web_text,
         concept_context=concept_ctx,
+        candidate_block=candidate_block,
     )
 
     # ----- 4. LLM classification ------------------------------------------
@@ -461,20 +561,46 @@ def _capture_one(
     artifact_id = _unique_artifact_id(parsed["artifact_id"])
     parsed["artifact_id"] = artifact_id
 
-    concept_id_proposed = parsed["concept_id"]
+    concept_id = parsed["concept_id"]
     is_new_concept = bool(parsed.get("is_new_concept", False))
 
-    # If concept already exists, use it; if proposed as new but collides, make unique
+    if is_new_concept and vault.concept_exists(concept_id):
+        # The LLM re-derived an existing slug while calling it "new" — that means
+        # it's the same idea. Attach instead of forking a `-2`, and flag for review.
+        log.info(
+            "proposed 'new' concept %r already exists; attaching instead of forking", concept_id
+        )
+        is_new_concept = False
+        parsed["review_needed"] = True
+    elif not is_new_concept and not vault.concept_exists(concept_id):
+        # The LLM pointed at a concept that doesn't exist — treat as new.
+        log.warning("LLM proposed non-existent concept %r; treating as new concept", concept_id)
+        is_new_concept = True
+
+    # Concept dedup gate: a genuinely new concept that is semantically almost
+    # identical to an existing one gets redirected to that concept (flagged for
+    # review) rather than added as a near-duplicate.
     if is_new_concept:
-        concept_id = _unique_concept_id(concept_id_proposed)
-    else:
-        concept_id = concept_id_proposed
-        # Validate the proposed existing concept actually exists
-        if not vault.concept_exists(concept_id):
-            log.warning(
-                "LLM proposed non-existent concept %r; treating as new concept", concept_id
+        dedup_threshold = float(cfg.thresholds.get("concept_dedup", 0.93))
+        nearest = _nearest_concept(
+            concept_index,
+            label=parsed.get("concept_label", concept_id),
+            what_it_is=parsed.get("concept_what_it_is") or parsed.get("what_it_is", ""),
+            why_it_matters=parsed.get("concept_why_it_matters") or "",
+        )
+        if nearest and nearest[0] != concept_id and nearest[1] > dedup_threshold:
+            near_id, near_score = nearest
+            log.info(
+                "concept dedup: proposed %r ~ existing %r (sim=%.2f); attaching to existing",
+                concept_id, near_id, near_score,
             )
-            is_new_concept = True
+            print(
+                f"  ↪ proposed new concept '{concept_id}' is {near_score:.2f} similar to "
+                f"existing '{near_id}' — attaching there (review_needed)."
+            )
+            concept_id = near_id
+            is_new_concept = False
+            parsed["review_needed"] = True
 
     # ----- 6. build artifact body -----------------------------------------
     artifact_body = render_artifact(
@@ -561,7 +687,6 @@ def _capture_one(
         log.error("artifact embedding upsert failed for %s: %s", artifact_id, exc)
 
     try:
-        concept_index = Index(cfg, layer="concepts")
         concept_index.upsert(concept_id, concept.body)
     except Exception as exc:  # noqa: BLE001
         log.error("concept embedding upsert failed for %s: %s", concept_id, exc)
@@ -573,7 +698,8 @@ def _capture_one(
         f"Captured: {artifact_id} ({parsed['artifact_type']}, "
         f"evaluation={parsed['evaluation']}, relevance={parsed['relevance']})"
     )
-    print(f"  concept: {concept_id} ({parsed['concept_label']}){new_marker}{review_marker}")
+    concept_label = concept.frontmatter.get("label", parsed["concept_label"])
+    print(f"  concept: {concept_id} ({concept_label}){new_marker}{review_marker}")
     print(f"  relationship: {parsed['relationship']}")
     print(f"  source: {source}")
     if parsed.get("github_repo"):
@@ -638,10 +764,15 @@ def capture(
             context_md = cfg.context_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             context_md = ""
+        candidate_query = _candidate_query(
+            source=source, snapshot=snapshot, readme=readme,
+            web_text=web_text, raw_input=input,
+        )
+        candidate_block = _candidate_block(candidate_query, Index(cfg, layer="concepts"))
         prompt = _assemble_prompt(
             context_md=context_md, source=source, raw_input=input,
             snapshot=snapshot, readme=readme, web_text=web_text,
-            concept_context=_concept_context(),
+            concept_context=_concept_context(), candidate_block=candidate_block,
         )
         print("=== DRY RUN ===")
         print(f"source: {source}")
