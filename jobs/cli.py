@@ -251,39 +251,56 @@ def init_cmd(
     config_path = lib_config.get_config_path()
     vault_path = Path(vault).expanduser().resolve() if vault else Path("~/raidar-vault").expanduser()
 
+    # A vault is "existing" if it already holds tracked content or git history.
+    # In that case we treat it as authoritative and never scaffold over it —
+    # we only ensure the regeneratable runtime dirs (embeddings/, logs/) exist.
+    vault_exists = vault_path.is_dir() and (
+        (vault_path / ".git").is_dir()
+        or any((vault_path / d).is_dir() for d in ("concepts", "artifacts", "signals"))
+    )
+
     typer.echo(f"\nInitialising raidar")
     typer.echo(f"  config  : {config_path}")
     typer.echo(f"  vault   : {vault_path}\n")
 
-    # ---- 1. Vault directories ------------------------------------------
-    for subdir in ("concepts", "artifacts", "signals", "digests", "embeddings", "logs"):
-        d = vault_path / subdir
-        d.mkdir(parents=True, exist_ok=True)
-        # Keep empty directories in git with a .gitkeep
-        gitkeep = d / ".gitkeep"
-        if not any(d.iterdir()):
-            gitkeep.touch()
-    typer.echo(f"  {_check_mark(True)} vault directories created")
-
-    # ---- 2. Vault .gitignore -------------------------------------------
-    gi = vault_path / ".gitignore"
-    if not gi.exists():
-        gi.write_text(_VAULT_GITIGNORE)
-        typer.echo(f"  {_check_mark(True)} vault/.gitignore created")
+    # ---- 1. Vault ------------------------------------------------------
+    if vault_exists:
+        typer.echo(f"  · found existing vault at {vault_path} — leaving its contents untouched")
+        # Only ensure the gitignored, fully-regeneratable runtime dirs exist;
+        # they won't be present in a fresh clone.
+        for subdir in ("embeddings", "logs"):
+            (vault_path / subdir).mkdir(parents=True, exist_ok=True)
+        typer.echo(f"  {_check_mark(True)} ensured runtime directories (embeddings/, logs/)")
     else:
-        typer.echo(f"  · vault/.gitignore already exists — skipped")
+        typer.echo(f"  · no existing vault found — scaffolding a new one")
 
-    # ---- 3. Vault README -----------------------------------------------
-    readme = vault_path / "README.md"
-    if not readme.exists():
-        readme.write_text(_VAULT_README)
-        typer.echo(f"  {_check_mark(True)} vault/README.md created")
-    else:
-        typer.echo(f"  · vault/README.md already exists — skipped")
+        # ---- 1a. Vault directories -------------------------------------
+        for subdir in ("concepts", "artifacts", "signals", "digests", "embeddings", "logs"):
+            d = vault_path / subdir
+            d.mkdir(parents=True, exist_ok=True)
+            # Keep empty directories in git with a .gitkeep
+            gitkeep = d / ".gitkeep"
+            if not any(d.iterdir()):
+                gitkeep.touch()
+        typer.echo(f"  {_check_mark(True)} vault directories created")
 
-    # ---- 4. git init the vault -----------------------------------------
-    git_dir = vault_path / ".git"
-    if not git_dir.is_dir():
+        # ---- 2. Vault .gitignore ---------------------------------------
+        gi = vault_path / ".gitignore"
+        if not gi.exists():
+            gi.write_text(_VAULT_GITIGNORE)
+            typer.echo(f"  {_check_mark(True)} vault/.gitignore created")
+        else:
+            typer.echo(f"  · vault/.gitignore already exists — skipped")
+
+        # ---- 3. Vault README -------------------------------------------
+        readme = vault_path / "README.md"
+        if not readme.exists():
+            readme.write_text(_VAULT_README)
+            typer.echo(f"  {_check_mark(True)} vault/README.md created")
+        else:
+            typer.echo(f"  · vault/README.md already exists — skipped")
+
+        # ---- 4. git init the vault -------------------------------------
         result = subprocess.run(
             ["git", "init", str(vault_path)],
             capture_output=True, text=True,
@@ -292,45 +309,51 @@ def init_cmd(
             typer.echo(f"  {_check_mark(True)} git init {vault_path}")
         else:
             typer.echo(f"  {_check_mark(False)} git init failed: {result.stderr.strip()}")
-    else:
-        typer.echo(f"  · vault is already a git repo — skipped")
 
-    # ---- 5. context.md -------------------------------------------------
-    context_path = vault_path / "context.md"
-    if not context_path.exists():
-        # Check if context.md exists in current working directory to copy it (migration safeguard)
-        local_context = Path.cwd() / "context.md"
-        if local_context.is_file():
-            import shutil
-            shutil.copy(local_context, context_path)
-            typer.echo(f"  {_check_mark(True)} context.md copied from current directory to vault")
+        # ---- 5. context.md ---------------------------------------------
+        context_path = vault_path / "context.md"
+        if not context_path.exists():
+            # Migration safeguard: copy a context.md from the current directory if present.
+            local_context = Path.cwd() / "context.md"
+            if local_context.is_file():
+                import shutil
+                shutil.copy(local_context, context_path)
+                typer.echo(f"  {_check_mark(True)} context.md copied from current directory to vault")
+            else:
+                context_path.write_text(_CONTEXT_MD_TEMPLATE)
+                typer.echo(f"  {_check_mark(True)} context.md created in vault — edit this to anchor the LLM")
         else:
-            context_path.write_text(_CONTEXT_MD_TEMPLATE)
-            typer.echo(f"  {_check_mark(True)} context.md created in vault — edit this to anchor the LLM")
-    else:
-        typer.echo(f"  · context.md already exists in vault — skipped")
+            typer.echo(f"  · context.md already exists in vault — skipped")
 
     # ---- 6. config.yaml ------------------------------------------------
-    if not config_path.exists():
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(_CONFIG_YAML_TEMPLATE.format(vault_path=str(vault_path)))
-        typer.echo(f"  {_check_mark(True)} config.yaml created at {config_path}")
-    else:
-        # Check if the vault path in config matches what was requested
+    # Never overwrite an existing config. It may be managed by a dotfile
+    # manager (chezmoi, stow, …); in that case init must be a no-op here.
+    if config_path.exists():
         try:
             import yaml
             with open(config_path) as f:
-                cfg = yaml.safe_load(f)
+                cfg = yaml.safe_load(f) or {}
             configured_vault = Path(cfg.get("vault", {}).get("path", "")).expanduser()
             if configured_vault.resolve() != vault_path:
                 typer.echo(
-                    f"  ⚠  config.yaml exists but vault.path={cfg['vault']['path']!r} "
-                    f"— update it to {vault_path} if needed"
+                    f"  ⚠  config.yaml already exists at {config_path}, but its "
+                    f"vault.path={cfg.get('vault', {}).get('path')!r} does not match "
+                    f"{vault_path}. Left untouched — edit it by hand if needed."
                 )
             else:
-                typer.echo(f"  · config.yaml already exists at {config_path} and vault path matches — skipped")
+                typer.echo(
+                    f"  · config.yaml already exists at {config_path} (vault path matches) "
+                    f"— left untouched"
+                )
         except Exception:
-            typer.echo(f"  · config.yaml already exists at {config_path} — skipped")
+            typer.echo(
+                f"  · config.yaml already exists at {config_path} — left untouched "
+                f"(could not parse it; check it by hand)"
+            )
+    else:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(_CONFIG_YAML_TEMPLATE.format(vault_path=str(vault_path)))
+        typer.echo(f"  {_check_mark(True)} config.yaml created at {config_path}")
 
     # ---- 7. .env check -------------------------------------------------
     env_path = config_path.parent / ".env"
