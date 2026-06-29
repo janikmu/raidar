@@ -83,6 +83,7 @@ check "health --help"  uv run python -m jobs.health --help
 check "merge-concept --help" uv run python -m jobs.merge --help
 check "rename-concept --help" uv run python -m jobs.rename --help
 check "reindex --help" uv run python -m jobs.reindex --help
+check "install-launchd --help" uv run python -m jobs.launchd --help
 check "search list-concepts against empty vault" uv run python -m jobs.search list-concepts
 check "health against empty vault" uv run python -m jobs.health
 
