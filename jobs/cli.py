@@ -1,7 +1,8 @@
 """raidar — AI Radar command-line interface.
 
 Usage:
-    raidar init               [--vault PATH] [--seed]
+    raidar init               [--vault PATH] [--seed] [--launchd]
+    raidar install-launchd    [--uninstall]
     raidar seed               [--id ID]... [--list] [--dry-run] [--force]
     raidar capture <url>      [--force] [--update ID] [--dry-run] [--no-backfill]
     raidar bulk-capture <url> [--dry-run] [--limit N] [--force]
@@ -57,6 +58,7 @@ from jobs.health import health as _health_cmd  # noqa: E402
 from jobs.merge import merge_concept as _merge_cmd  # noqa: E402
 from jobs.rename import rename_concept as _rename_cmd  # noqa: E402
 from jobs.reindex import reindex as _reindex_cmd  # noqa: E402
+from jobs.launchd import install_launchd as _install_launchd_cmd  # noqa: E402
 
 app.command("capture")(capture)
 app.command("bulk-capture")(bulk)
@@ -69,6 +71,7 @@ app.command("health")(_health_cmd)
 app.command("merge-concept")(_merge_cmd)
 app.command("rename-concept")(_rename_cmd)
 app.command("reindex")(_reindex_cmd)
+app.command("install-launchd")(_install_launchd_cmd)
 app.add_typer(_search_app, name="search")
 
 # ---------------------------------------------------------------------------
@@ -245,6 +248,13 @@ def init_cmd(
              "(MCP, RAG, ReAct, ...) from training-data knowledge. Skipped if "
              "required env vars aren't set yet.",
     ),
+    launchd: bool = typer.Option(
+        False,
+        "--launchd",
+        help="Also install the macOS launchd agents (enrich + digest). Safe to "
+             "rerun any time — e.g. after moving to a new machine and realising "
+             "the scheduled jobs were never set up. Skipped on non-macOS.",
+    ),
 ) -> None:
     """Create the vault directory structure and scaffold the project config."""
     from lib import config as lib_config
@@ -395,6 +405,18 @@ def init_cmd(
         else:
             typer.echo("\n  Seeding canonical concepts (raidar seed)…")
             _seed_cmd(ids=None, list_only=False, dry_run=False, force=False)
+
+    # ---- 8b. Optional launchd install -----------------------------------
+    if launchd:
+        import platform as _platform
+        if _platform.system() != "Darwin":
+            typer.echo("\n  --launchd skipped: launchd is macOS-only.")
+        else:
+            typer.echo("\n  Installing launchd agents (enrich + digest)…")
+            from jobs.launchd import run_install_script
+            code = run_install_script("install")
+            if code != 0:
+                typer.echo("  ⚠ launchd install failed — see output above.")
 
     # ---- 9. Summary ----------------------------------------------------
     typer.echo("")

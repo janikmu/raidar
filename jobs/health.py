@@ -340,6 +340,23 @@ def check_orphan_signals(v: _VaultView, cfg: config_module.Config) -> list[Findi
     )]
 
 
+def check_launchd_agents() -> list[Finding]:
+    """macOS only: flag scheduled enrich/digest agents that were never installed
+    (or were lost — e.g. after a fresh machine setup that skipped that step)."""
+    import platform
+    if platform.system() != "Darwin":
+        return []
+    from jobs.launchd import EXPECTED_LABELS, installed_plists
+    missing = sorted(set(EXPECTED_LABELS) - set(installed_plists()))
+    if not missing:
+        return []
+    return [Finding(
+        "launchd", WARN, "launchd",
+        f"{len(missing)} scheduled job(s) not installed: " + ", ".join(missing),
+        "raidar install-launchd",
+    )]
+
+
 def check_review_pending(v: _VaultView) -> list[Finding]:
     flagged = [c.id for c in v.concepts if c.frontmatter.get("review_needed")]
     if not flagged:
@@ -443,6 +460,7 @@ def run_checks(
     findings += check_legacy_cruft(cfg)
     findings += check_orphan_signals(v, cfg)
     findings += check_review_pending(v)
+    findings += check_launchd_agents()
     if semantic:
         findings += check_near_dup_concepts(v, cfg, threshold)
     findings.sort(key=lambda f: (_SEVERITY_ORDER.get(f.severity, 9), f.check, f.entity))

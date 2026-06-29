@@ -101,16 +101,16 @@ raidar search artifact <artifact-id-the-capture-printed>
 Ensure automated background processing runs weekly:
 
 ```bash
-./infra/install_launchd.sh
+raidar install-launchd
 launchctl list | grep airadar     # both com.airadar.enrich and com.airadar.digest should appear
 ```
 
-This setup script:
+(equivalently `./infra/install_launchd.sh`, which the command wraps — or pass `--launchd` to `raidar init` to do this in the same step). This setup:
 - Safely checks that you are running on macOS (`Darwin`).
 - Dynamically templates the `launchd` plist jobs to use the global `raidar` binary from your `PATH` (falling back to repository `uv run` if not globally installed).
 - Directs `stdout` and `stderr` logs straight to your vault's `logs/` directory (e.g. `~/raidar-vault/logs/launchd.enrich.out.log`) so they are easy to monitor.
 
-To uninstall background jobs: `./infra/install_launchd.sh uninstall`.
+It's easy to forget this step on a new machine — `raidar health` checks for it and warns if the agents aren't installed. To uninstall background jobs: `raidar install-launchd --uninstall`.
 
 ### 8. Connect Cowork
 
@@ -131,6 +131,7 @@ ai-radar-tool/                    (this repo - stateless utility)
     health.py                     vault health checks (dangling refs, dup/forked concepts, drift)
     merge.py                      merge a duplicate concept into another (remediation)
     reindex.py                    rebuild embedding indexes from disk; prune orphans/legacy files
+    launchd.py                    install/remove macOS launchd agents (wraps infra/install_launchd.sh)
     search.py                     CLI: query concepts, artifacts, signals, digests
     cli.py                        unified `raidar` entry point
   lib/
