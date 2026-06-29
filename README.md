@@ -6,7 +6,7 @@
 
 Personal AI tooling intelligence system. Captures, enriches, and surfaces
 knowledge about the AI tooling landscape from URLs, notes, and scheduled
-GitHub signal pulls.This repo is the **tool**. The knowledge vault is a separate private repo (default: `~/raidar-vault`), and the configuration is stored in the standard user config path (e.g. `~/.config/raidar/config.yaml`).
+GitHub signal pulls.This repo is the **tool**. The knowledge vault is a separate private repo (default: `~/raidar-vault`), and the configuration is stored at `~/.config/raidar/config.yaml`.
 
 The vault uses a **two-layer knowledge model**:
 1. **Concepts**: Intellectual ideas (e.g., `multi-agent-frameworks`) with a lifecycle status (`emerging`, `watch`, `invest`, `common`, `superseded`, `abandoned`).
@@ -49,7 +49,7 @@ This does the following automatically:
 - Creates a `logs/` directory inside your vault to house execution and automated logs.
 - Templates a default `.gitignore` in the vault to automatically ignore `embeddings/` and `logs/`.
 - Templates a default `context.md` directly inside the vault.
-- Scaffolds a custom `config.yaml` at your standard user configuration directory (e.g., `~/.config/raidar/config.yaml` on macOS/Linux).
+- Scaffolds a `config.yaml` at `~/.config/raidar/config.yaml` (override with the `RAIDAR_CONFIG` env var). If one already exists there — e.g. managed by a dotfile manager like chezmoi — it is left untouched.
 
 ### 3. Configure Secrets
 

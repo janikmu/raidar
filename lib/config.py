@@ -16,15 +16,10 @@ def get_config_path() -> Path:
     # 1. Environment variable override
     if "RAIDAR_CONFIG" in os.environ:
         return Path(os.environ["RAIDAR_CONFIG"]).expanduser().resolve()
-    
-    # 2. Check ~/.config/raidar/config.yaml first (standard developer shortcut)
-    dev_path = Path.home() / ".config" / "raidar" / "config.yaml"
-    if dev_path.exists():
-        return dev_path
-    
-    # 3. Standard platform-specific configuration path
-    from platformdirs import user_config_dir
-    return Path(user_config_dir("raidar", appauthor=False)) / "config.yaml"
+
+    # 2. Single canonical location: ~/.config/raidar/config.yaml
+    #    (XDG-style, portable, and friendly to dotfile managers like chezmoi).
+    return Path.home() / ".config" / "raidar" / "config.yaml"
 
 
 CONFIG_PATH = get_config_path()
